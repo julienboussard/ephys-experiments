@@ -102,7 +102,7 @@ def get_ks_sorting(pid, one=None):
     ba = AllenAtlas()
     sl = SpikeSortingLoader(pid=pid, one=one, atlas=ba)
     spikes, clusters, channels = sl.load_spike_sorting()
-    times_samples = spikes["times"].astype(int)
+    times_samples = sl.samples2times(spikes["times"], direction="reverse")
     labels = spikes["clusters"].astype(int)
     return DARTsortSorting(
         times_samples=times_samples,
