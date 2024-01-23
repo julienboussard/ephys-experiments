@@ -2,6 +2,9 @@ from os import symlink
 from pathlib import Path
 
 import spikeinterface.full as si
+from brainbox.io.one import SpikeSortingLoader
+from dartsort import DARTsortSorting
+from ibllib.atlas import AllenAtlas
 from one.api import ONE
 
 sdsc_base_path = Path("/mnt/sdceph/users/ibl/data")
@@ -79,3 +82,12 @@ def read_and_destripe_popeye_cbin_ibl(
         rec, mode="mean+std", num_chunks_per_segment=num_chunks_per_segment, seed=seed
     )
     return rec
+
+
+def get_ks_sorting(pid):
+    one = ONE()
+    ba = AllenAtlas()
+    sl = SpikeSortingLoader(pid=pid, one=one, atlas=ba)
+    spikes, clusters, channels = sl.load_spike_sorting()
+    times_samples = spikes["times"]
+    return DARTsortSorting(times_samples=times_samples, labels=clusters, channels=channels)
