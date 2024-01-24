@@ -96,6 +96,33 @@ def read_and_destripe_popeye_cbin_ibl(
     return rec
 
 
+def read_and_catgt_popeye_cbin_ibl(
+    pid,
+    symlink_folder,
+    one=None,
+    num_chunks_per_segment=100,
+    seed=0,
+    remove_bad_channels=True,
+):
+    rec = read_popeye_cbin_ibl(pid, symlink_folder, one=one)
+    rec = rec.astype("float32")
+    rec = si.highpass_filter(rec)
+    if remove_bad_channels:
+        bad_channel_ids, channel_labels = si.detect_bad_channels(
+            rec, num_random_chunks=num_chunks_per_segment, seed=seed
+        )
+        rec = rec.remove_channels(bad_channel_ids)
+    rec = si.phase_shift(rec)
+    rec = si.common_reference(rec)
+    rec = si.zscore(
+        rec,
+        mode="mean+std",
+        num_chunks_per_segment=num_chunks_per_segment,
+        seed=seed,
+    )
+    return rec
+
+
 def get_ks_sorting(pid, one=None):
     if one is None:
         one = ONE()
