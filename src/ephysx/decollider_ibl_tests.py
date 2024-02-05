@@ -22,6 +22,7 @@ def test(
     noise_same_channels=False,
     trough_offset_samples=42,
     spike_length_samples=121,
+    return_waveforms=False,
 ):
     rg = np.random.default_rng(random_seed)
 
@@ -116,6 +117,12 @@ def test(
     naive_diff = naive_pred - gt_waveforms
     df["naive_l2err"] = np.linalg.norm(naive_diff, axis=(1, 2))
     df["naive_maxerr"] = np.abs(naive_diff).max(axis=(1, 2))
+    if return_waveforms:
+        waveforms = dict(
+            gt_waveforms=gt_waveforms,
+            noisy_waveforms=noisy_waveforms,
+            naive_pred=naive_pred,
+        )
     del naive_pred, naive_diff
 
     # n2n prediction
@@ -127,9 +134,13 @@ def test(
             ],
             dim=0,
         )
+        if return_waveforms:
+            waveforms[f"n2n_pred_{k}"] = n2n_pred
         n2n_diff = n2n_pred - gt_waveforms
         df[f"n2n_{k}sample{'s'*(k>1)}_l2err"] = np.linalg.norm(n2n_diff, axis=(1, 2))
         df[f"n2n_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(axis=(1, 2))
         del n2n_pred, n2n_diff
 
+    if return_waveforms:
+        return df, waveforms
     return df
