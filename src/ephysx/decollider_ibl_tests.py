@@ -2,11 +2,13 @@ import colorcet as cc
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 from dartsort.util import decollider_util as dcu
 from dartsort.util import spikeio
 from dartsort.vis import geomplot
 
 
+@torch.no_grad()
 def test(
     net,
     recording,
@@ -26,6 +28,7 @@ def test(
     trough_offset_samples=42,
     spike_length_samples=121,
     return_waveforms=False,
+    device=None,
 ):
     rg = np.random.default_rng(random_seed)
 
@@ -40,12 +43,13 @@ def test(
         full_channel_index, recording_channels_subset
     )
 
-    templates = np.full(
+    templates_ = np.full(
         (templates.shape[0], n_channels_full + 1, spike_length_samples),
         np.nan,
         dtype=templates.dtype,
     )
-    templates[:, recording_channels_subset] = templates.transpose(0, 2, 1)
+    templates_[:, recording_channels_subset] = templates.transpose(0, 2, 1)
+    templates = templates_
     maxchans = np.nanargmax(templates.ptp(2), 1)
 
     # pick spikes
@@ -53,24 +57,34 @@ def test(
     units = np.unique(labels)
     units = units[units > 0]
     for u in units:
-        in_unit = np.flatnonzero(units == u)
+        in_unit = np.flatnonzero(labels == u)
+        in_unit = in_unit[
+            (times[in_unit] >= trough_offset_samples)
+            & (
+                times[in_unit]
+                < recording.get_num_samples()
+                - templates.shape[2]
+                + trough_offset_samples
+            )
+        ]
         if in_unit.size > max_count_per_unit:
             in_unit = rg.choice(in_unit, size=max_count_per_unit, replace=False)
         which.append(in_unit)
     which = np.concatenate(which)
     which.sort()
+    print(f"bq {which.size=} {(which.size/len(templates))=}")
 
     times = times[which]
-    full_channels = maxchans[which]
-    rec_channels = np.searchsorted(recording_channels_subset, maxchans)[which]
     labels = labels[which]
+    rec_channels = np.searchsorted(recording_channels_subset, maxchans)[labels]
+    full_channels = maxchans[labels]
 
     # template waveforms
     waveform_channels = full_channel_index[full_channels][:, :, None]
     gt_waveforms = templates[
         labels[:, None, None],
         waveform_channels,
-        np.arange(templates.shape[1])[None, None, :],
+        np.arange(templates.shape[2])[None, None, :],
     ]
 
     # noisy waveforms
@@ -98,26 +112,41 @@ def test(
             rg=rg,
             to_torch=False,
         )
-        for _ in range(n2n_samples)
+        for _ in range(max(n2n_samples))
     ]
+
+    # handle missing channels
+    channel_mask = np.isfinite(noisy_waveforms[:, :, 0])
+    mask = channel_mask[..., None].astype(noisy_waveforms.dtype)
+    gt_waveforms = np.nan_to_num(gt_waveforms)
+    noisy_waveforms = np.nan_to_num(noisy_waveforms)
 
     # we'll build up a dataframe with lots of info
     df = pd.DataFrame()
 
     # template-related covariates
-    df["template_maxptp"] = templates.ptp(2).max(1)[labels]
-    df["template_norm"] = np.nansum(np.square(templates), axis=(1, 2))[labels]
+    df["template_maxptp"] = np.nanmax(templates.ptp(2), axis=1)[labels]
+    df["template_l2norm"] = np.sqrt(
+        np.nansum(np.square(templates), axis=(1, 2))
+    )[labels]
     if spike_counts is not None:
         df["unit_spike_count"] = spike_counts[labels]
 
     # noise-related covariates
-    df["wf_template_diff_norm"] = np.linalg.norm(
-        noisy_waveforms - gt_waveforms, axis=(1, 2)
+    df["noise1_l2norm"] = np.linalg.norm(
+        mask * (noisy_waveforms - gt_waveforms), axis=(1, 2)
     )
+    print(f"{df.noise1_l2norm.min()=} {df.noise1_l2norm.max()=}")
 
     # unsupervised prediction
-    naive_pred = dcu.batched_infer(net, noisy_waveforms)
-    naive_diff = naive_pred - gt_waveforms
+    naive_pred = dcu.batched_infer(
+        net,
+        noisy_waveforms,
+        channel_masks=channel_mask,
+        device=device,
+        show_progress=True,
+    )
+    naive_diff = mask * (naive_pred - gt_waveforms)
     df["naive_l2err"] = np.linalg.norm(naive_diff, axis=(1, 2))
     df["naive_maxerr"] = np.abs(naive_diff).max(axis=(1, 2))
     if return_waveforms:
@@ -127,15 +156,27 @@ def test(
             naive_pred=naive_pred,
         )
     del naive_pred, naive_diff
+    print(f"{df.naive_l2err.min()=} {df.naive_l2err.max()=}")
 
     # n2n prediction
+    noise2 = [
+        dcu.batched_n2n_infer(
+            net,
+            noisy_waveforms + np.nan_to_num(n2),
+            alpha=n2n_alpha,
+            channel_masks=channel_mask,
+            device=device,
+            show_progress=True,
+        )
+        for n2 in noise2
+    ]
     for k in n2n_samples:
-        n2n_pred = np.mean(
-            [
-                dcu.batched_n2n_infer(net, noisy_waveforms + n2, alpha=n2n_alpha)
-                for n2 in noise2
-            ],
-            dim=0,
+        n2n_pred = np.mean(noise2[:k], axis=0)
+        n2n_diff = mask * (n2n_pred - gt_waveforms)
+        n2n_l2 = np.linalg.norm(n2n_diff, axis=(1, 2))
+        df[f"n2n_{k}sample{'s'*(k>1)}_l2err"] = n2n_l2
+        df[f"n2n_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(
+            axis=(1, 2)
         )
         if return_waveforms:
             waveforms[f"n2n_pred_{k}"] = n2n_pred
@@ -143,6 +184,7 @@ def test(
         df[f"n2n_{k}sample{'s'*(k>1)}_l2err"] = np.linalg.norm(n2n_diff, axis=(1, 2))
         df[f"n2n_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(axis=(1, 2))
         del n2n_pred, n2n_diff
+        print(f"{n2n_l2.min()=} {n2n_l2.max()=}")
 
     if return_waveforms:
         return df, waveforms
