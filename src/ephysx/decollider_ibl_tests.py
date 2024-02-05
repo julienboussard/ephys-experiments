@@ -1,7 +1,10 @@
+import colorcet as cc
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from dartsort.util import decollider_util as dcu
 from dartsort.util import spikeio
+from dartsort.vis import geomplot
 
 
 def test(
@@ -144,3 +147,114 @@ def test(
     if return_waveforms:
         return df, waveforms
     return df
+
+
+def comparison_vis(
+    names2wfdicts,
+    spike_index,
+    top_height=2,
+    height=3,
+    prev_color="r",
+    prev_name="prev_single_chan_denoiser",
+    scatter_kw=dict(s=2, lw=0, alpha=0.5),
+):
+    names = list(names2wfdicts.keys())
+    assert all(
+        np.array_equal(
+            list(names2wfdicts[names[0]].keys()),
+            list(names2wfdicts[name].keys())
+        )
+        for name in names
+    )
+    assert all(
+        np.array_equal(
+            names2wfdicts[name]["gt_waveforms"][spike_index],
+            names2wfdicts[names[0]]["gt_waveforms"][spike_index]
+        )
+        for name in names
+    )
+    gtwf = names2wfdicts[names[0]]["gt_waveforms"][spike_index]
+    noisywf = names2wfdicts[names[0]]["noisy_waveforms"][spike_index]
+
+    colors = {}
+    j = 0
+    for name in names:
+        if name == prev_name:
+            colors[name] = prev_color
+        else:
+            colors[name] = cc.glasbey_light[j]
+            j += 1
+
+    # check largest n2n k
+    n2nk = max(int(k.split("_")[-1]) for k in names2wfdicts[names[0]].keys() if k.startswith("n2n"))
+
+    npreds = len(names2wfdicts[names[0]]) - 1
+    nrows = len(names)
+    ncols = 2 * npreds
+    nchans = gtwf.shape[1]
+
+    fig = plt.figure(
+        figsize=(top_height + height * nrows, ncols),
+        layout="constrained",
+    )
+    top, bottom = fig.subfigures(nrows=2)
+    naive_l2_ax, naive_max_ax, n2n_l2_ax, n2n_max_ax = top.subplots(ncols=4, sharey=True)
+    axs = bottom.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        sharex=True,
+        sharey=True,
+        gridspec_kw=dict(wspace=0, hspace=0),
+    )
+
+    geom = np.c_[np.zeros(nchans), np.arange(float(nchans))]
+    max_abs_amp = np.abs(gtwf).max()
+
+    for ax in axs[:, ::2].flat:
+        geomplot(noisywf, geom=geom, ax=ax, max_abs_amp=max_abs_amp, color="gray")
+        geomplot(gtwf, geom=geom, ax=ax, max_abs_amp=max_abs_amp, color="k")
+
+    for j, (name, wf_dict) in enumerate(names2wfdicts.items()):
+        naive_pred = wf_dict["naive_pred"][spike_index]
+        n2nkeys = [k for k in wf_dict.keys() if k.startswith("n2n")]
+        assert n2nkeys[-1].endswith(f"_{n2nk}")
+
+        row_axs = axs[j]
+        row_axs[0].set_ylabel(name)
+        if not j:
+            row_axs[0].set_title("naive pred", fontsize=8)
+            row_axs[1].set_title("naive gtresid", fontsize=8)
+            for n, k in enumerate(n2nkeys):
+                row_axs[2 + 2 * n].set_title(f"{k} pred", fontsize=8)
+                row_axs[3 + 2 * n].set_title(f"{k} gtresid", fontsize=8)
+
+        color = colors[name]
+
+        naive_diff = gtwf - naive_pred
+        geomplot(naive_pred, geom=geom, ax=row_axs[0], max_abs_amp=max_abs_amp, color=color)
+        geomplot(naive_diff, geom=geom, ax=row_axs[1], max_abs_amp=max_abs_amp, color=color)
+
+        for n, k in enumerate(n2nkeys):
+            n2n_pred = wf_dict[k][spike_index]
+            n2n_diff = gtwf - n2n_pred
+            geomplot(naive_pred, geom=geom, ax=row_axs[2 + 2 * n], max_abs_amp=max_abs_amp, color=color)
+            geomplot(naive_diff, geom=geom, ax=row_axs[3 + 2 * n], max_abs_amp=max_abs_amp, color=color)
+
+        gt_ptp = gtwf.ptp(0)
+        naive_l2 = np.linalg.norm(naive_diff, axis=0)
+        naive_max = np.abs(naive_diff).max(0)
+        n2n_l2 = np.linalg.norm(n2n_diff, axis=0)
+        n2n_max = np.abs(n2n_diff).max(0)
+        naive_l2_ax.scatter(gt_ptp, naive_l2, color=color, **scatter_kw)
+        naive_max_ax.scatter(gt_ptp, naive_max, color=color, **scatter_kw)
+        n2n_l2_ax.scatter(gt_ptp, n2n_l2, color=color, **scatter_kw)
+        n2n_max_ax.scatter(gt_ptp, n2n_max, color=color, **scatter_kw)
+
+    naive_l2_ax.set_title("naive l2 err")
+    naive_max_ax.set_title("naive max err")
+    n2n_l2_ax.set_title(f"n2n {n2nk} samps l2 err")
+    n2n_max_ax.set_title(f"n2n {n2nk} max err")
+    for ax in (naive_l2_ax, naive_max_ax, n2n_l2_ax, n2n_max_ax):
+        ax.set_xlabel("per-channel gt ptp")
+
+    return fig
