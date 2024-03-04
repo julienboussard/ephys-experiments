@@ -67,15 +67,24 @@ def read_popeye_cbin_ibl(pid, symlink_folder, one=None):
     cbin_path, ch_path, meta_path = pid2sdscpath(pid, one=one)
     symlink(
         cbin_path,
-        symlink_folder / cbin_path.with_suffix("").with_suffix("").with_suffix(".ap.cbin").name,
+        symlink_folder
+        / cbin_path.with_suffix("")
+        .with_suffix("")
+        .with_suffix(".ap.cbin")
+        .name,
     )
     symlink(
         ch_path,
-        symlink_folder / ch_path.with_suffix("").with_suffix("").with_suffix(".ap.ch").name,
+        symlink_folder
+        / ch_path.with_suffix("").with_suffix("").with_suffix(".ap.ch").name,
     )
     symlink(
         meta_path,
-        symlink_folder / meta_path.with_suffix("").with_suffix("").with_suffix(".ap.meta").name,
+        symlink_folder
+        / meta_path.with_suffix("")
+        .with_suffix("")
+        .with_suffix(".ap.meta")
+        .name,
     )
 
     return si.read_cbin_ibl(str(symlink_folder))
@@ -162,6 +171,59 @@ def get_ks_sorting(pid, one=None):
     spikes, clusters, channels = sl.load_spike_sorting()
     times_samples = sl.samples2times(spikes["times"], direction="reverse")
     labels = spikes["clusters"].astype(int)
+    return DARTsortSorting(
+        times_samples=times_samples,
+        channels=np.zeros_like(labels),
+        labels=labels,
+    )
+
+
+def get_ks_sorting_popeye(pid, one=None):
+    assert sdsc_base_path.exists()
+    if one is None:
+        one = ONE()
+
+    eid, probe = one.pid2eid(pid)
+    alyx_base_path = one.eid2path(eid)
+
+    rel_path = one.list_datasets(eid, f"alf/{probe}/pykilosort*spikes.times.npy")
+    print(f"{rel_path=}")
+    if len(rel_path) != 1:
+        print("wrong number of rel path, trying another...")
+        rel_path = one.list_datasets(eid, f"alf/{probe}*spikes.times.npy")
+    assert len(rel_path) == 1
+
+    rel_path = Path(rel_path[0])
+    searchdir = (
+        sdsc_base_path
+        / alyx_base_path.relative_to(one.cache_dir)
+        / rel_path.parent
+    )
+    pattern = Path(rel_path.name).with_suffix(f".*.npy")
+    glob = list(searchdir.glob(str(pattern)))
+    print(f"{len(glob)=}")
+    assert len(glob) == 1
+    spikes_times_npy = glob[0]
+    assert spikes_times_npy.exists()
+
+    # get labels
+    spikes_clusters_npy = searchdir.glob(
+        str(
+            Path(rel_path.name)
+            .with_suffix("")  # npy
+            .with_suffix("")  # uuid
+            .with_suffix(".clusters.*.npy")
+        )
+    )
+    spikes_clusters_npy = list(spikes_clusters_npy)
+    print(f"{len(spikes_clusters_npy)=}")
+    assert len(spikes_clusters_npy) == 1
+    spikes_clusters_npy = spikes_clusters_npy[0]
+
+    print(f"{pid=} {probe=} {spikes_times_npy=} {spikes_clusters_npy=}")
+
+    times_samples = np.load(spikes_times_npy)
+    labels = np.load(spikes_clusters_npy)
     return DARTsortSorting(
         times_samples=times_samples,
         channels=np.zeros_like(labels),

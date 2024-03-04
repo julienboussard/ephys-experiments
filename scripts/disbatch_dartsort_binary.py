@@ -13,6 +13,7 @@ if __name__ == "__main__":
     ap.add_argument("--config_paths", nargs="+")
     ap.add_argument("--out_dir")
     ap.add_argument("--env", default="sp")
+    ap.add_argument("--novis", action="store_true")
     ap.add_argument("--n_jobs_gpu", type=int, default=0)
     ap.add_argument("--n_jobs_cpu", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true")
@@ -46,7 +47,11 @@ if __name__ == "__main__":
 
         name = cfg_py.stem
         cfg_out_dir = out_dir / name
-        cfg_out_dir.mkdir(exist_ok=True)
+        cfg_out_dir.mkdir(exist_ok=True, parents=True)
+
+        if not args.novis:
+            vis_out_dir = out_dir / f"vis{name}"
+            vis_out_dir.mkdir(exist_ok=True)
 
         for j, (recname, sipath) in enumerate(
             zip(args.names, args.si_rec_paths)
@@ -65,10 +70,22 @@ if __name__ == "__main__":
             )
             if args.subtraction_from:
                 dartsort_cmd += f" --take_subtraction_from {args.subtraction_from[j]}"
-            logfile = this_out_dir / "log.txt"
 
+            if not args.novis:
+                this_vis_out_dir = vis_out_dir / recname
+                dartvis_cmd = (
+                    "dartvis_si_all "
+                    f"--n_jobs_gpu {args.n_jobs_gpu} "
+                    f"--n_jobs_cpu {args.n_jobs_cpu} "
+                    f"{sipath} "
+                    f"{this_out_dir} "
+                    f"{this_vis_out_dir}"
+                )
+                dartsort_cmd += f" ; {dartvis_cmd}"
+
+            logfile = this_out_dir / "log.txt"
             tasks[task_ix] = (
-                f"{{ source ~/.bashrc ; mamba activate {args.env} ; {dartsort_cmd} ; }} > {logfile}"
+                f"{{ source ~/.bashrc ; mamba activate {args.env} ; {dartsort_cmd} ; }} > {logfile} 2>&1"
             )
             if args.dry_run:
                 print(f"{task_ix=} {tasks[task_ix]=}")

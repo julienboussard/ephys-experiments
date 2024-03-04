@@ -22,22 +22,18 @@ if __name__ == "__main__":
 
     args = ap.parse_args(args)
 
+    # determine jobs: for each binary folder, for each config, do the sorting
+    tasks = {}
     db = disBatch.DisBatcher(tasksname="disbatch_test", args=db_args)
     print(f"main: {db=}")
-
-    # determine jobs: for each binary folder, for each config, do the sorting
-    out_dir = Path(args.out_dir)
-    task_ix = 0
-    tasks = {}
-    for i in range(args.n_jobs):
-        cmd = f"""python -c 'import sys; print(f'job: {i=} {sys.executable=}')'"""
+    for task_ix in range(args.n_jobs):
+        cmd = f"""python -c "import sys; print(f'job {task_ix=}: {{sys.executable=}}')" """
 
         tasks[task_ix] = (
-            f"{{ source ~/.bashrc ; mamba activate {args.env} ; {cmd} }}"
+            f"{{ echo {task_ix} ; source ~/.bashrc ; mamba activate {args.env} ; {cmd} ; }} > task{task_ix}.txt 2>&1"
         )
         print(f"main: {task_ix=} {tasks[task_ix]=}")
         db.submit(tasks[task_ix])
-        task_ix += 1
 
     tid2status = db.syncTasks(tasks)
     for tid in tasks:
