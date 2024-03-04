@@ -61,21 +61,46 @@ def read_popeye_cbin_ibl(pid, symlink_folder, one=None):
     cbin_path, ch_path, meta_path = pid2sdscpath(pid, one=one)
     symlink(
         cbin_path,
-        symlink_folder / cbin_path.with_suffix("").with_suffix(".ap.cbin").name,
+        symlink_folder / cbin_path.with_suffix("").with_suffix("").with_suffix(".ap.cbin").name,
     )
     symlink(
         ch_path,
-        symlink_folder / ch_path.with_suffix("").with_suffix(".ap.ch").name,
+        symlink_folder / ch_path.with_suffix("").with_suffix("").with_suffix(".ap.ch").name,
     )
     symlink(
         meta_path,
-        symlink_folder / meta_path.with_suffix("").with_suffix(".ap.meta").name,
+        symlink_folder / meta_path.with_suffix("").with_suffix("").with_suffix(".ap.meta").name,
     )
 
     return si.read_cbin_ibl(str(symlink_folder))
 
 
 def read_and_destripe_popeye_cbin_ibl(
+    pid, symlink_folder, one=None, num_chunks_per_segment=100, seed=0
+):
+    print("read")
+    rec = read_popeye_cbin_ibl(pid, symlink_folder, one=one)
+    rec = rec.astype("float32")
+    rec = si.highpass_filter(rec)
+    print("bad chans start...")
+    bad_channel_ids, channel_labels = si.detect_bad_channels(
+        rec, num_random_chunks=num_chunks_per_segment, seed=seed
+    )
+    print(f"{bad_channel_ids=}")
+    rec = si.phase_shift(rec)
+    rec = si.interpolate_bad_channels(rec, bad_channel_ids)
+    rec = si.highpass_spatial_filter(rec)
+    print("zscore...")
+    rec = si.zscore(
+        rec,
+        mode="mean+std",
+        num_chunks_per_segment=num_chunks_per_segment,
+        seed=seed,
+    )
+    return rec
+
+
+def read_and_lightppx_popeye_cbin_ibl(
     pid, symlink_folder, one=None, num_chunks_per_segment=100, seed=0
 ):
     rec = read_popeye_cbin_ibl(pid, symlink_folder, one=one)
@@ -86,7 +111,7 @@ def read_and_destripe_popeye_cbin_ibl(
     )
     rec = si.phase_shift(rec)
     rec = si.interpolate_bad_channels(rec, bad_channel_ids)
-    rec = si.highpass_spatial_filter(rec)
+    rec = si.common_reference(rec)
     rec = si.zscore(
         rec,
         mode="mean+std",
