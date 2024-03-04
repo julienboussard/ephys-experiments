@@ -1,3 +1,4 @@
+import hashlib
 from os import symlink
 from pathlib import Path
 
@@ -9,6 +10,11 @@ from ibllib.atlas import AllenAtlas
 from one.api import ONE
 
 sdsc_base_path = Path("/mnt/sdceph/users/ibl/data")
+
+
+def pid2randomseed(pid):
+    shake = hashlib.shake_128(pid.encode())
+    return int(shake.hexdigest(16), 16)
 
 
 def pid2sdscpath(pid, one=None):
