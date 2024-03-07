@@ -1,106 +1,31 @@
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.14.5
-#   kernelspec:
-#     display_name: Python [conda env:sp]
-#     language: python
-#     name: conda-env-sp-py
-# ---
-
-# %%
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
-from dartsort.templates import TemplateData, template_util
-from dartsort import DARTsortSorting, TemplateConfig
-from dartsort.util import data_util, waveform_util, hybrid_util
-from dartsort.main import subtract
-import spikeinterface.full as si
-from one.api import ONE
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-from ephysx import ibl_util#, decollider_ibl_tests
-import shutil
+import argparse
 import pickle
-import numpy as np
-from dartsort.peel import ThresholdAndFeaturize
-import torch
-import h5py
-import pandas as pd
-from dartsort.util import multiprocessing_util
-import dartsort
-import string
-import cloudpickle
-from tqdm.auto import trange, tqdm
+import shutil
+import sys
+import tempfile
+import time
 import traceback
+from pathlib import Path
 
-# %%
-dartsort.__file__
+import numpy as np
+from dartsort import TemplateConfig
+from dartsort.templates import TemplateData, template_util
+from dartsort.util import data_util
+from ephysx import ibl_util
+from one.api import ONE
 
-# %%
-denoised_template_config = TemplateConfig(
-    superres_templates=False,
-    registered_templates=False,
-    realign_peaks=False,
-)
 
-# %%
-raw_template_config = TemplateConfig(
-    superres_templates=False,
-    registered_templates=False,
-    realign_peaks=False,
-    low_rank_denoising=False
-)
-
-# %%
-1
-
-# %%
-one = ONE()
-one
-
-# %%
-df = pd.read_csv("~/ceph/2023_12_bwm_release.csv")
-pids = df.pid.values
-pids[:5]
-
-# %%
-data_dir = Path("~/ceph/bwm_700").expanduser()
-data_dir.mkdir(exist_ok=True)
-
-# %%
-# shutil.rmtree(data_dir)
-
-# %%
-allsyms_dir = Path("~/ceph/bwm_700_syms").expanduser()
-allsyms_dir.mkdir(exist_ok=True)
-
-# %%
-scratch_dir = Path("/tmp/templatescratchspace").expanduser()
-if scratch_dir.exists():
-    shutil.rmtree(scratch_dir)
-
-# %% [markdown]
-# ## Compute templates and store preprocessed recordings
-
-# %%
-n_jobs = 12
-
-# %%
-overwrite = False
-retry_err = True
-summarize_errors = False
-
-for pid in tqdm(pids):
-    print(pid)
+def extract_templates(
+    pid,
+    scratch_dir,
+    allsyms_dir,
+    data_dir,
+    n_jobs=1,
+    overwrite=False,
+    retry_err=True,
+    summarize_errors=False,
+    memory_gb=220,
+):
     symlink_dir = allsyms_dir / f"syms{pid}"
     temps_dir = data_dir / f"temps{pid}"
     sorting_pkl = temps_dir / f"sorting{pid}.pkl"
@@ -130,6 +55,8 @@ for pid in tqdm(pids):
 
     # rec0 = ibl_util.read_popeye_cbin_ibl(pid, symlink_dir)
     try:
+        one = ONE()
+        one
         print("load sorting...")
         if sorting_pkl.exists() and not overwrite and not had_err:
             with open(sorting_pkl, "rb") as jar:
@@ -139,9 +66,7 @@ for pid in tqdm(pids):
 
         if symlink_dir.exists():
             shutil.rmtree(symlink_dir)
-        rec0 = ibl_util.read_and_lightppx_popeye_cbin_ibl(
-            pid, symlink_dir, one=one
-        )
+        rec0 = ibl_util.read_and_lightppx_popeye_cbin_ibl(pid, symlink_dir, one=one)
         traces0 = rec0.get_traces(0, 0, 100)
         if np.isnan(traces0).any():
             raise ValueError(
@@ -151,7 +76,9 @@ for pid in tqdm(pids):
             )
         # rec = rec0
         # rec = rec0.save_to_folder(scratch_dir, n_jobs=n_jobs)
-        if rec0.get_num_samples() // 30_000 < 5000:
+        # 4/2^30=2^28
+        rec_mem = np.ceil((rec0.get_num_samples() * rec0.get_num_channels()) / (2**28))
+        if rec_mem < memory_gb:
             rec = rec0.save_to_memory(n_jobs=n_jobs)
         else:
             rec = rec0.save_to_folder(scratch_dir, n_jobs=0)
@@ -171,7 +98,7 @@ for pid in tqdm(pids):
                 realign_max_sample_shift=60,
                 n_jobs=n_jobs,
                 device="cpu",
-                # show_progress=False,
+                show_progress=False,
             )
             sorting = data_util.subset_sorting_by_time_samples(
                 sorting,
@@ -182,8 +109,19 @@ for pid in tqdm(pids):
             with open(sorting_pkl, "wb") as jar:
                 pickle.dump(sorting, jar)
 
-        print("temps...")
-        td = TemplateData.from_config(
+        denoised_template_config = TemplateConfig(
+            superres_templates=False,
+            registered_templates=False,
+            realign_peaks=False,
+        )
+        raw_template_config = TemplateConfig(
+            superres_templates=False,
+            registered_templates=False,
+            realign_peaks=False,
+            low_rank_denoising=False,
+        )
+        print("raw temps...")
+        TemplateData.from_config(
             rec,
             sorting,
             template_config=raw_template_config,
@@ -191,8 +129,10 @@ for pid in tqdm(pids):
             n_jobs=n_jobs,
             device="cpu",
             save_npz_name="raw_template_data.npz",
+            show_progress=False,
         )
-        td = TemplateData.from_config(
+        print("denoised temps...")
+        TemplateData.from_config(
             rec,
             sorting,
             template_config=denoised_template_config,
@@ -200,6 +140,7 @@ for pid in tqdm(pids):
             n_jobs=n_jobs,
             save_npz_name="denoised_template_data.npz",
             device="cpu",
+            show_progress=False,
         )
     except Exception as e:
         print(f"{e=} {str(e)=} {repr(e)=}")
@@ -210,24 +151,42 @@ for pid in tqdm(pids):
         if (temps_dir / "error.pkl").exists():
             print("previously had error but this time survived")
             (temps_dir / "error.pkl").unlink()
-    finally:
-        if scratch_dir.exists():
-            shutil.rmtree(scratch_dir)
-    import gc; gc.collect()
-    import torch; torch.cuda.empty_cache()
 
-    # subtract(rec, subtraction_folder, n_jobs=4)
 
-# %%
-1
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pid")
+    ap.add_argument("--data_dir", default="~/ceph/bwm_700")
+    ap.add_argument("--allsyms_dir", default="~/ceph/bwm_700_syms")
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--retry_err", action="store_true")
+    ap.add_argument("--summarize_errors", action="store_true")
+    ap.add_argument("--n_jobs", type=int)
+    args = ap.parse_args()
 
-# %%
-rec
+    data_dir = Path(args.data_dir).expanduser()
+    data_dir.mkdir(exist_ok=True)
 
-# %%
-rec0
+    allsyms_dir = Path(args.allsyms_dir).expanduser()
+    allsyms_dir.mkdir(exist_ok=True)
 
-# %%
-# !ls {scratch_dir}
+    log_txt = data_dir / f"log{args.pid}.txt"
+    with open(log_txt, "a") as logf:
+        sys.stdout = logf
+        sys.stderr = logf
+        print("bwm_templates", time.strftime("%Y-%m-%d %H:%M"))
+        print(f"{sys.executable=}")
+        print(f"{args=}")
 
-# %%
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            scratch_dir = Path(scratch_dir)
+            extract_templates(
+                args.pid,
+                scratch_dir,
+                allsyms_dir,
+                data_dir,
+                n_jobs=1,
+                overwrite=args.overwrite,
+                retry_err=args.retry_err,
+                summarize_errors=args.summarize_errors,
+            )
