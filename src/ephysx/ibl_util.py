@@ -8,6 +8,7 @@ from brainbox.io.one import SpikeSortingLoader
 from dartsort import DARTsortSorting
 from ibllib.atlas import AllenAtlas
 from one.api import ONE
+import pandas as pd
 
 sdsc_base_path = Path("/mnt/sdceph/users/ibl/data")
 
@@ -169,6 +170,7 @@ def get_ks_sorting(pid, one=None):
     ba = AllenAtlas()
     sl = SpikeSortingLoader(pid=pid, one=one, atlas=ba)
     spikes, clusters, channels = sl.load_spike_sorting()
+    print(f'{spikes["times"]=} {spikes["times"].min()=} {spikes["times"].max()=}')
     times_samples = sl.samples2times(spikes["times"], direction="reverse")
     labels = spikes["clusters"].astype(int)
     return DARTsortSorting(
@@ -178,7 +180,7 @@ def get_ks_sorting(pid, one=None):
     )
 
 
-def get_ks_sorting_popeye(pid, one=None):
+def get_ks_sorting_popeye(pid, one=None, return_uuids=False):
     assert sdsc_base_path.exists()
     if one is None:
         one = ONE()
@@ -186,11 +188,11 @@ def get_ks_sorting_popeye(pid, one=None):
     eid, probe = one.pid2eid(pid)
     alyx_base_path = one.eid2path(eid)
 
-    rel_path = one.list_datasets(eid, f"alf/{probe}/pykilosort*spikes.times.npy")
+    rel_path = one.list_datasets(eid, f"alf/{probe}/pykilosort*spikes.samples.npy")
     print(f"{rel_path=}")
     if len(rel_path) != 1:
         print("wrong number of rel path, trying another...")
-        rel_path = one.list_datasets(eid, f"alf/{probe}*spikes.times.npy")
+        rel_path = one.list_datasets(eid, f"alf/{probe}*spikes.samples.npy")
     assert len(rel_path) == 1
 
     rel_path = Path(rel_path[0])
@@ -203,8 +205,9 @@ def get_ks_sorting_popeye(pid, one=None):
     glob = list(searchdir.glob(str(pattern)))
     print(f"{len(glob)=}")
     assert len(glob) == 1
-    spikes_times_npy = glob[0]
-    assert spikes_times_npy.exists()
+    spikes_samples_npy = glob[0]
+    assert spikes_samples_npy.exists()
+    print(f"{searchdir=} {spikes_samples_npy=}")
 
     # get labels
     spikes_clusters_npy = searchdir.glob(
@@ -220,12 +223,28 @@ def get_ks_sorting_popeye(pid, one=None):
     assert len(spikes_clusters_npy) == 1
     spikes_clusters_npy = spikes_clusters_npy[0]
 
-    print(f"{pid=} {probe=} {spikes_times_npy=} {spikes_clusters_npy=}")
+    print(f"{pid=} {probe=} {spikes_samples_npy=} {spikes_clusters_npy=}")
 
-    times_samples = np.load(spikes_times_npy)
+    samples = np.load(spikes_samples_npy)
+    print(f"{samples.min()=} {samples.max()=}")
+    # times_samples = sl.samples2times(times, direction="reverse")
     labels = np.load(spikes_clusters_npy)
-    return DARTsortSorting(
-        times_samples=times_samples,
+    sorting = DARTsortSorting(
+        times_samples=samples,
         channels=np.zeros_like(labels),
         labels=labels,
     )
+    if not return_uuids:
+        return sorting
+    
+    
+    # get uuids
+    clusters_uuids_csv = searchdir.glob("clusters.uuids.*.csv")
+    clusters_uuids_csv = list(clusters_uuids_csv)
+    print(f"{len(clusters_uuids_csv)=}")
+    assert len(clusters_uuids_csv) == 1
+    clusters_uuids_csv = clusters_uuids_csv[0]
+    
+    uuids = pd.read_csv(clusters_uuids_csv).uuids.values
+    return sorting, uuids
+    

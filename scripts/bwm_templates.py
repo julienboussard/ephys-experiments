@@ -24,11 +24,10 @@ def extract_templates(
     overwrite=False,
     retry_err=True,
     summarize_errors=False,
-    memory_gb=220,
+    memory_gb=300,
 ):
     symlink_dir = allsyms_dir / f"syms{pid}"
     temps_dir = data_dir / f"temps{pid}"
-    sorting_pkl = temps_dir / f"sorting{pid}.pkl"
     if overwrite and temps_dir.exists():
         shutil.rmtree(symlink_dir)
         shutil.rmtree(temps_dir)
@@ -36,7 +35,7 @@ def extract_templates(
     done = temps_dir.exists() and (temps_dir / "denoised_template_data.npz").exists()
     if done:
         print("already done")
-        continue
+        return
 
     had_err = temps_dir.exists() and (temps_dir / "error.pkl").exists()
     if had_err:
@@ -47,9 +46,9 @@ def extract_templates(
             (temps_dir / "error.pkl").unlink()
             print("retrying")
         else:
-            continue
+            return
     if summarize_errors:
-        continue
+        return
 
     temps_dir.mkdir(exist_ok=True)
 
@@ -58,11 +57,7 @@ def extract_templates(
         one = ONE()
         one
         print("load sorting...")
-        if sorting_pkl.exists() and not overwrite and not had_err:
-            with open(sorting_pkl, "rb") as jar:
-                sorting = pickle.load(jar)
-        else:
-            sorting = ibl_util.get_ks_sorting_popeye(pid, one=one)
+        sorting, uuids = ibl_util.get_ks_sorting_popeye(pid, one=one, return_uuids=True)
 
         if symlink_dir.exists():
             shutil.rmtree(symlink_dir)
@@ -81,33 +76,30 @@ def extract_templates(
         if rec_mem < memory_gb:
             rec = rec0.save_to_memory(n_jobs=n_jobs)
         else:
-            rec = rec0.save_to_folder(scratch_dir, n_jobs=0)
+            rec = rec0.save_to_folder(scratch_dir, n_jobs=n_jobs)
         # rec.set_times(rec0.get_times())
 
-        if not sorting_pkl.exists():
-            print("preprocess sorting")
-            sorting = data_util.subset_sorting_by_time_samples(
-                sorting,
-                start_sample=42,
-                end_sample=rec.get_num_samples() - 79,
-                reference_to_start_sample=False,
-            )
-            sorting = template_util.get_realigned_sorting(
-                rec,
-                sorting,
-                realign_max_sample_shift=60,
-                n_jobs=n_jobs,
-                device="cpu",
-                show_progress=False,
-            )
-            sorting = data_util.subset_sorting_by_time_samples(
-                sorting,
-                start_sample=42,
-                end_sample=rec.get_num_samples() - 79,
-                reference_to_start_sample=False,
-            )
-            with open(sorting_pkl, "wb") as jar:
-                pickle.dump(sorting, jar)
+        print("preprocess sorting")
+        sorting = data_util.subset_sorting_by_time_samples(
+            sorting,
+            start_sample=42,
+            end_sample=rec.get_num_samples() - 79,
+            reference_to_start_sample=False,
+        )
+        sorting = template_util.get_realigned_sorting(
+            rec,
+            sorting,
+            realign_max_sample_shift=60,
+            n_jobs=n_jobs,
+            device="cpu",
+            show_progress=False,
+        )
+        sorting = data_util.subset_sorting_by_time_samples(
+            sorting,
+            start_sample=42,
+            end_sample=rec.get_num_samples() - 79,
+            reference_to_start_sample=False,
+        )
 
         denoised_template_config = TemplateConfig(
             superres_templates=False,
@@ -121,26 +113,32 @@ def extract_templates(
             low_rank_denoising=False,
         )
         print("raw temps...")
-        TemplateData.from_config(
+        raw_td = TemplateData.from_config(
             rec,
             sorting,
             template_config=raw_template_config,
-            save_folder=temps_dir,
+            # save_folder=temps_dir,
             n_jobs=n_jobs,
             device="cpu",
-            save_npz_name="raw_template_data.npz",
-            show_progress=False,
+            # save_npz_name="raw_template_data.npz",
         )
         print("denoised temps...")
-        TemplateData.from_config(
+        dn_td = TemplateData.from_config(
             rec,
             sorting,
             template_config=denoised_template_config,
-            save_folder=temps_dir,
+            # save_folder=temps_dir,
             n_jobs=n_jobs,
-            save_npz_name="denoised_template_data.npz",
+            # save_npz_name="denoised_template_data.npz",
             device="cpu",
-            show_progress=False,
+        )
+        np.savez(
+            temps_dir / "templates.npz",
+            raw_templates=raw_td.templates,
+            denoised_templates=dn_td.templates,
+            unit_ids=dn_td.unit_ids,
+            spike_counts=dn_td.spike_counts,
+            uuids=uuids[dn_td.unit_ids],
         )
     except Exception as e:
         print(f"{e=} {str(e)=} {repr(e)=}")
@@ -182,7 +180,7 @@ if __name__ == "__main__":
             scratch_dir = Path(scratch_dir)
             extract_templates(
                 args.pid,
-                scratch_dir,
+                scratch_dir / "rectmp",
                 allsyms_dir,
                 data_dir,
                 n_jobs=1,
