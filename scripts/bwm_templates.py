@@ -26,13 +26,15 @@ def extract_templates(
     summarize_errors=False,
     memory_gb=300,
 ):
+    print(f"{pid=} {overwrite=} {retry_err=} {summarize_errors=}")
+
     symlink_dir = allsyms_dir / f"syms{pid}"
     temps_dir = data_dir / f"temps{pid}"
     if overwrite and temps_dir.exists():
         shutil.rmtree(symlink_dir)
         shutil.rmtree(temps_dir)
 
-    done = temps_dir.exists() and (temps_dir / "denoised_template_data.npz").exists()
+    done = temps_dir.exists() and (temps_dir / "templates.npz").exists()
     if done:
         print("already done")
         return

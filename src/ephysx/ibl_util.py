@@ -27,7 +27,8 @@ def pid2sdscpath(pid, one=None):
     alyx_base_path = one.eid2path(eid)
 
     rel_path = one.list_datasets(eid, f"raw_ephys_data/{probe}*ap.cbin")
-    assert len(rel_path) == 1
+    if len(rel_path) != 1:
+        raise ValueError(f"Wrong number of datasets for ap.cbin: {rel_path}")
 
     rel_path = Path(rel_path[0])
     searchdir = (
@@ -37,7 +38,8 @@ def pid2sdscpath(pid, one=None):
     )
     pattern = Path(rel_path.name).with_suffix(f".*.cbin")
     glob = list(searchdir.glob(str(pattern)))
-    assert len(glob) == 1
+    if len(glob) != 1:
+        raise ValueError(f"Wrong number of paths for ap.cbin: {glob}")
     cbin_path = glob[0]
     assert cbin_path.exists()
 
@@ -188,11 +190,11 @@ def get_ks_sorting_popeye(pid, one=None, return_uuids=False):
     eid, probe = one.pid2eid(pid)
     alyx_base_path = one.eid2path(eid)
 
-    rel_path = one.list_datasets(eid, f"alf/{probe}/pykilosort*spikes.samples.npy")
+    rel_path = one.list_datasets(eid, f"alf/{probe}/pykilosort/spikes.samples.npy")
     print(f"{rel_path=}")
     if len(rel_path) != 1:
         print("wrong number of rel path, trying another...")
-        rel_path = one.list_datasets(eid, f"alf/{probe}*spikes.samples.npy")
+        rel_path = one.list_datasets(eid, f"alf/{probe}/spikes.samples.npy")
     assert len(rel_path) == 1
 
     rel_path = Path(rel_path[0])
