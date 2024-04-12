@@ -44,10 +44,12 @@ def pid2sdscpath(pid, one=None):
     assert cbin_path.exists()
 
     # get meta and .ch
-    ch_path = list(cbin_path.parent.glob("*ap*.ch"))
+    pattern = Path(rel_path.name).with_suffix(f".*.ch")
+    ch_path = list(cbin_path.parent.glob(str(pattern)))
     assert len(ch_path) == 1
     ch_path = ch_path[0]
-    meta_path = list(cbin_path.parent.glob("*ap*.meta"))
+    pattern = Path(rel_path.name).with_suffix(f".*.meta")
+    meta_path = list(cbin_path.parent.glob(str(pattern)))
     assert len(meta_path) == 1
     meta_path = meta_path[0]
 
