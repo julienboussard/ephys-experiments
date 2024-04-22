@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dartsort.cluster import density
+from dartsort.util import drift_util, waveform_util
 from torch import nn
 
 tqdm_kw = dict(smoothing=0)
@@ -19,13 +20,13 @@ class SpikePCAData:
     keepers: np.array
     n_reg_chans: int
     tpca_rank: int
-    n_tpca_chans: int
+    n_chans_cluster : int
     n_wf_chans: int
     n_spikes: int
     cluster_channel_index: np.array
     static_amp_vecs: torch.Tensor
     tpca_embeds: np.array
-    tpca_static_chans: np.array
+    spike_static_channels: np.array
 
 
 class BasicSpikePCAClusterer(nn.Module):
@@ -33,6 +34,7 @@ class BasicSpikePCAClusterer(nn.Module):
     def __init__(
         self,
         sorting,
+        motion_est=None,
         rank=5,
         svd_atol=0.01,
         svd_max_iter=100,
@@ -40,7 +42,6 @@ class BasicSpikePCAClusterer(nn.Module):
         wf_radius=25.0,
         min_unit_size=50,
         n_wfs_fit=8192,
-        motion_est=None,
         min_overlap=0.5,
         buffer_growth_factor=1.5,
         train_units_batch_size=16,
@@ -58,7 +59,7 @@ class BasicSpikePCAClusterer(nn.Module):
         self.min_overlap = min_overlap
         self.spike_batch_size = spike_batch_size
 
-        self.labels, self.data = _load_data(sorting, fit_radius, wf_radius)
+        self.labels, self.data = _load_data(sorting, motion_est, fit_radius, wf_radius)
         self.dim_input = self.data.tpca_rank * self.data.n_tpca_chans
 
         self.drop_small()
@@ -71,7 +72,7 @@ class BasicSpikePCAClusterer(nn.Module):
             "components", torch.zeros((U, self.dim_input, self.svd_rank))
         )
         self.register_buffer("mean", torch.zeros((U, self.dim_input)))
-        self.wf_to_pc_reindexers = get_channel_structures(self.data.pca_channel_index)
+        self.wf_to_pc_reindexers = get_channel_structures(self.data.cluster_channel_index)
         # self.register_buffer("_channel_reindexer", torch.tensor(self.wf_to_pc_reindexers))
         self.train_loadings = np.full((U, self.n_wfs_fit, self.rank), np.nan)
         self.train_spike_indices = np.full((U, self.n_wfs_fit), -1)
@@ -174,8 +175,8 @@ class BasicSpikePCAClusterer(nn.Module):
         # intialize empties with the mean
         # TODO: impute here?
         X = F.pad(m, (0, 1))
-        X = X[None, None].broadcast_to(n, r, self.data.n_pca_chans + 1).contiguous()
-        rel_ix = rel_ix[:, None, :].broadcast_to((n, r, self.data.n_pca_chans))
+        X = X[None, None].broadcast_to(n, r, self.data.n_chans_cluster + 1).contiguous()
+        rel_ix = rel_ix[:, None, :].broadcast_to((n, r, self.data.n_chans_cluster))
         X.scatter_(waveforms, dim=2, index=rel_ix)
         W = self.components[unit_id]
         return (X - m) @ W.T
@@ -183,9 +184,9 @@ class BasicSpikePCAClusterer(nn.Module):
     def reconstruct_spikes(self, unit_id, loadings, rel_ix):
         n = len(loadings)
         recons_rel = torch.addmm(self.mean[unit_id], loadings, self.components[unit_id])
-        recons_rel = recons_rel.reshape(n, -1 , self.data.n_pca_chans)
+        recons_rel = recons_rel.reshape(n, -1 , self.data.n_chans_cluster)
         recons_rel = F.pad(recons_rel, (0, 1))
-        rel_ix = rel_ix[:, None, :].broadcast_to((n, -1, self.data.n_pca_chans))
+        rel_ix = rel_ix[:, None, :].broadcast_to((n, -1, self.data.n_chans_cluster))
         return torch.gather(recons_rel, dim=2, index=rel_ix)
 
     def calc_reconstruction_errors(self):
@@ -258,14 +259,14 @@ class BasicSpikePCAClusterer(nn.Module):
         """
         Returns
         -------
-        X : shape (n_wfs_fit, tpca_dim, n_pca_chans)
-        missing : shape (n_wfs_fit, n_pca_chans)
+        X : shape (n_wfs_fit, tpca_dim, n_chans_cluster)
+        missing : shape (n_wfs_fit, n_chans_cluster)
         """
         n_units = unit_ids.size
         snrs = self.unit_channel_snrs(unit_ids)
         main_channels = snrs.argmax(1)
         unit_reindexers = self.wf_to_pc_reindexers[main_channels]
-        nc_pca = self.data.n_pca_chans
+        nc_pca = self.data.n_chans_cluster
         nc_full = self.data.n_reg_chans
 
         X = np.full(
@@ -284,7 +285,7 @@ class BasicSpikePCAClusterer(nn.Module):
                 in_unit.sort()
             nj = in_unit.size
 
-            chans = self.data.tpca_static_chans[in_unit]
+            chans = self.data.spike_static_channels[in_unit]
             embeds = self.data.tpca_embeds[in_unit]
 
             reindexer = unit_reindexers[j]
@@ -314,7 +315,7 @@ class BasicSpikePCAClusterer(nn.Module):
         Returns
         -------
         overlaps : (n_units, n_spikes)
-        rel_ix : (n_units, n_spikes, n_pca_chans)
+        rel_ix : (n_units, n_spikes, n_chans_cluster)
         """
         if unit_ids is None:
             unit_ids = self.unit_ids()
@@ -327,10 +328,10 @@ class BasicSpikePCAClusterer(nn.Module):
 
         rel_ix = np.take_along_axis(
             unit_reindexers[:, None],
-            self.data.tpca_static_chans[None, :],
+            self.data.spike_static_channels[None, :],
             axis=2,
         )
-        overlapping = rel_ix < self.data.n_pca_chans
+        overlapping = rel_ix < self.data.n_chans_cluster
         overlaps = overlapping.mean(2)
         if single:
             assert overlaps.shape[0] == rel_ix.shape[0] == 1
@@ -339,22 +340,22 @@ class BasicSpikePCAClusterer(nn.Module):
         return overlaps, rel_ix
 
 
-def get_channel_structures(pca_channel_index):
+def get_channel_structures(cluster_channel_index):
     """
     Helps us to convert each spike's static channels into each unit's space.
 
     So, later, we'll want to put spikes living on `static_chans` shape (n, n_wf_chans)
-    into a training buffer `X` shape (n, :, n_pca_chans). A user can do this like:
+    into a training buffer `X` shape (n, :, n_chans_cluster). A user can do this like:
 
     ```
     spike_to_unit = wf_to_pc_reindexers[unit_main_channel, static_chans]
     X.scatter_(src=spikes, dim=2, index=spike_to_unit)
     ```
 
-    The trick is that X actually needed to have shape (n, :, n_pca_chans + 1), and the
+    The trick is that X actually needed to have shape (n, :, n_chans_cluster + 1), and the
     extra channel eats up the invalid stuff.
 
-    We also can get observed masks. O has shape (n, n_pca_chans + 1). Then we set
+    We also can get observed masks. O has shape (n, n_chans_cluster + 1). Then we set
 
     ```
     O[torch.arange(n)[:, None], spike_to_unit] = 1
@@ -362,20 +363,20 @@ def get_channel_structures(pca_channel_index):
 
     Then this means that
         wf_to_pc_reindexers[c, d] =
-            index of d (a registered chan) in pca_channel_index[c], if present
-            n_pca_chans (==pca_channel_index.shape[1]) otherwise
+            index of d (a registered chan) in cluster_channel_index[c], if present
+            n_chans_cluster (==cluster_channel_index.shape[1]) otherwise
 
     Returns
     -------
-    wf_to_pc_reindexers : int tensor, shape (n_units, n_reg_chans, n_pca_chans)
+    wf_to_pc_reindexers : int tensor, shape (n_units, n_reg_chans, n_chans_cluster)
         wf_to_pc_reindexers[u, c] is an array of indices in [0, ..., n_wf_chans].
         Inclusive on the right -- waveforms need to be padded (with 0s) to be
         indexed by it.
     """
-    nc, n_pca_chans = pca_channel_index.shape
-    wf_to_pc_reindexers = np.full((nc, nc + 1), n_pca_chans)
+    nc, n_chans_cluster = cluster_channel_index.shape
+    wf_to_pc_reindexers = np.full((nc, nc + 1), n_chans_cluster)
     for c in range(nc):
-        for i, d in enumerate(pca_channel_index[c]):
+        for i, d in enumerate(cluster_channel_index[c]):
             if d < nc:
                 wf_to_pc_reindexers[c, d] = i
     return wf_to_pc_reindexers
@@ -439,25 +440,84 @@ def fit_pcas(
     return loadings, mean, components
 
 
-def _load_data(sorting, fit_radius=None, wf_radius=None):
+def _load_data(sorting, motion_est, fit_radius, wf_radius=None):
     # load up labels
     labels = sorting.labels
     keepers = np.flatnonzero(labels >= 0)
     labels = labels[keepers]
+    channels = sorting.channels[keepers]
 
     # load waveforms and subset by radius, retaining the new index for later
+    with h5py.File(sorting.parent_h5_path, "r", locking=False) as h5:
+        tpca_embeds = h5["collisioncleaned_tpca_embeds"][:][keepers]
+        amp_vecs = h5["denoised_ptp_amplitude_vectors"][:][keepers]
+        geom = h5["geom"][:]
+        oci = channel_index = h5["channel_index"][:]
+    if wf_radius is not None:
+        tpca_embeds, channel_index = waveform_util.channel_subset_by_radius(
+            tpca_embeds,
+            channels,
+            channel_index,
+            geom,
+        )
+        amp_vecs = waveform_util.channel_subset_by_index(
+            amp_vecs,
+            channels,
+            oci,
+            channel_index
+        )
+
+    pitch = drift_util.get_pitch(geom)
+    registered_geom = drift_util.registered_geometry(
+        geom, motion_est=motion_est
+    )
+    registered_kdtree = drift_util.KDTree(registered_geom)
+    match_distance = drift_util.pdist(geom).min() / 2
+    cluster_channel_index = waveform_util.make_channel_index(
+        registered_geom, fit_radius
+    )
+
+    n_reg_chans = len(registered_geom)
+    n_wf_chans = channel_index.shape[1]
+    n_chans_cluster = cluster_channel_index.shape[1]
+    tpca_rank = tpca_embeds.shape[1]
+    n_spikes = keepers.size
+
+    n_pitches_shift = drift_util.get_spike_pitch_shifts(
+        sorting.point_source_localizations[:, 2][keepers],
+        geom=geom,
+        motion_est=motion_est,
+        times_s=sorting.times_seconds[keepers],
+    )
 
     # where a channel is not present, this has n_reg_chans
     spike_static_channels = drift_util.static_channel_neighborhoods(
         geom,
-        sorting.channels[self.keepers],
-        self.channel_index,
-        pitch=self.pitch,
-        n_pitches_shift=self.n_pitches_shift,
-        registered_geom=self.registered_geom,
-        target_kdtree=self.registered_kdtree,
-        match_distance=self.match_distance,
+        sorting.channels[keepers],
+        channel_index,
+        pitch=pitch,
+        n_pitches_shift=n_pitches_shift,
+        registered_geom=registered_geom,
+        target_kdtree=registered_kdtree,
+        match_distance=match_distance,
         workers=4,
     )
 
-    return
+    static_amp_vecs = drift_util.grab_static(
+        torch.from_numpy(amp_vecs),
+        spike_static_channels,
+        n_reg_chans,
+    )
+
+    return SpikePCAData(
+        keepers=keepers,
+        n_reg_chans=n_reg_chans,
+        tpca_rank=tpca_rank,
+        n_chans_cluster=n_chans_cluster,
+        n_wf_chans=n_wf_chans,
+        n_spikes=n_spikes,
+        cluster_channel_index=cluster_channel_index,
+        static_amp_vecs=static_amp_vecs,
+        tpca_embeds=tpca_embeds,
+        spike_static_channels=spike_static_channels,
+    )
