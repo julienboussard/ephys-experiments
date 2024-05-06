@@ -11,6 +11,7 @@ from dartsort.util import drift_util, waveform_util
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.stats import chi2
 from sklearn.decomposition import PCA
+import torch.nn.functional as F
 
 from .ppca import PPCA, VBPCA
 
@@ -31,7 +32,6 @@ tqdm_kw = dict(smoothing=0)
 
 
 class SpikeLrGmm:
-
     def __init__(
         self,
         sorting,
@@ -39,11 +39,13 @@ class SpikeLrGmm:
         svd_atol=0.2,
         svd_max_iter=100,
         fit_radius=75.0,
+        wfs_radius=50.0,
         max_wfs_svd=25000,
-        geom=None,
+        # geom=None,
         motion_est=None,
         learn_vy=True,
         rg=0,
+        device="cpu",
     ):
         self.svd_rank = svd_rank
         self.svd_atol = svd_atol
@@ -51,6 +53,7 @@ class SpikeLrGmm:
         self.rg = np.random.default_rng(rg)
         self.max_wfs_svd = max_wfs_svd
         self.learn_vy = learn_vy
+        self.device = device
 
         # reindex labels -- this class will work in contiguous label space always
         # the torch.LongTensor call below will copy
@@ -64,12 +67,26 @@ class SpikeLrGmm:
             print(f"{small.size} too-small units")
             too_small = np.isin(self.labels, unit_ids[small])
             self.labels[too_small] = -1
+        channels = sorting.channels[self.keepers]
 
         # load up stuff we'll need
         with h5py.File(sorting.parent_h5_path, "r", locking=False) as h5:
             self.tpca_features = h5["collisioncleaned_tpca_features"][:][self.keepers]
             self.amp_vecs = h5["denoised_ptp_amplitude_vectors"][:][self.keepers]
             self.channel_index = h5["channel_index"][:]
+            geom = h5["geom"][:]
+        if wfs_radius:
+            self.tpca_features, new_channel_index = waveform_util.channel_subset_by_radius(
+                self.tpca_features,
+                channels,
+                self.channel_index,
+                geom,
+                radius=wfs_radius,
+            )
+            self.amp_vecs = waveform_util.channel_subset_by_index(
+                self.amp_vecs, channels, self.channel_index, new_channel_index
+            )
+            self.channel_index = new_channel_index
         self.n_pitches_shift = drift_util.get_spike_pitch_shifts(
             sorting.point_source_localizations[:, 2][self.keepers],
             geom=geom,
@@ -94,7 +111,7 @@ class SpikeLrGmm:
         self.registered_channel_index = waveform_util.make_channel_index(
             self.registered_geom, fit_radius
         )
-        self.channels = torch.from_numpy(sorting.channels[self.keepers])
+        self.channels = torch.from_numpy(channels)
 
         # this might be too big to store for real
         # n_spikes, chans_per_spike
@@ -157,9 +174,7 @@ class SpikeLrGmm:
         self.inus = {}
         self.inus_pca = {}
         for uid in self.unit_ids:
-            self.inus_pca[uid] = self.inus[uid] = np.flatnonzero(
-                self.labels == uid
-            )
+            self.inus_pca[uid] = self.inus[uid] = np.flatnonzero(self.labels == uid)
 
     def get_unit_max_channels(self, unit_ids=None):
         if unit_ids is None:
@@ -206,14 +221,20 @@ class SpikeLrGmm:
                 max_feature_ind=self.max_n_features,
                 learn_vy=self.learn_vy,
             )
+            self.pcas[uid].to(self.device)
             self.loadings[uid], _ = self.pcas[uid].fit_transform(
-                X,
+                torch.as_tensor(X, device=self.device),
                 max_iter=self.svd_max_iter,
                 atol=self.svd_atol,
             )
+            self.pcas[uid].to("cpu")
+            self.loadings[uid] = self.loadings[uid].numpy(force=True)
             c = torch.full((self.tpca_rank, self.n_reg_chans), torch.nan)
-            c[:, self.chans[uid]] = self.pcas[uid].mbar.reshape(
-                self.tpca_rank, self.chans[uid].size
+            c[:, self.chans[uid]] = (
+                self.pcas[uid]
+                .mbar.reshape(self.tpca_rank, self.chans[uid].size)
+                .cpu()
+                .detach()
             )
             self.rfull_centroids[uid] = c
 
@@ -240,22 +261,27 @@ class SpikeLrGmm:
         sigma_regional=None,
         n_neighbors_search=500,
         remove_clusters_smaller_than=50,
+        min_bin_size=0.01,
     ):
         """Split the unit. Reassign to sub-units. Update state variables."""
         # run the clustering
-        X = self.loadings[unit_id][:, :rank].numpy(force=True)
+        X = self.loadings[unit_id][:, :rank]
         split_labels = density.density_peaks_clustering(
             X,
             sigma_local=sigma_local,
             n_neighbors_search=n_neighbors_search,
             remove_clusters_smaller_than=remove_clusters_smaller_than,
+            min_bin_size=min_bin_size,
         )
         split_units = np.unique(split_labels)
         split_units = split_units[split_units >= 0]
         if split_units.size <= 1:
             return []
 
-        # replace labels with split labels, update params in those groups
+        # remove all points from cluster
+        self.labels[self.inus[unit_id]] = -1
+
+        # re-do labels with split labels, update params in those groups
         inu = self.inus_pca[unit_id]
         new_unit_ids = np.concatenate(
             ([unit_id], self.labels.max() + split_units[split_units >= 1])
@@ -264,13 +290,94 @@ class SpikeLrGmm:
             in_split = inu[split_labels == split_label]
             self.labels[in_split] = new_label
             self.inus_pca[new_label] = self.inus[new_label] = in_split
-        self.unit_ids = torch.unique(torch.concatenate((self.unit_ids, new_unit_ids)))
+        self.unit_ids = np.unique(np.concatenate((self.unit_ids, new_unit_ids)))
         self.get_unit_max_channels(new_unit_ids)
         self.fit_pcas(new_unit_ids, show_progress=False)
 
         return new_unit_ids
+    
+    def embedding_reassign(self, batch_size=32, min_size=50, outlier_quantile=0.9):
+        unit_ids = self.unit_ids
+        self.embed_norms = np.full((self.keepers.size, unit_ids.size), np.nan)
+        self.embed_mahals = np.full((self.keepers.size, unit_ids.size), np.nan)
+        self.embed_overlaps = np.full((self.keepers.size, unit_ids.size), np.nan)
 
-    def reassign(self, batch_size=256, min_size=50, outlier_quantile=0.9):
+        for batch_start in trange(
+            0, self.keepers.size, batch_size, desc="Reassign", **tqdm_kw
+        ):
+            batch_end = min(self.keepers.size, batch_start + batch_size)
+            bsl = slice(batch_start, batch_end)
+            nbatch = batch_end - batch_start
+
+            X = self.tpca_features[bsl].reshape(nbatch, -1)
+            chans = self.spike_static_channels[bsl]
+            Xix = F.pad(self.full_index_set, (0, 1, 0, 0), value=self.max_n_features)
+            Xix = Xix[None].broadcast_to(nbatch, *Xix.shape)
+            Xix = Xix[
+                torch.arange(nbatch)[:, None, None],
+                torch.arange(self.tpca_rank)[None, :, None],
+                chans[:, None, :],
+            ]
+            Xix = Xix.reshape(nbatch, -1)
+            O = torch.logical_and(torch.isfinite(X), Xix < self.max_n_features)
+
+            for j, uid in enumerate(unit_ids):
+                self.pcas[uid].to(self.device)
+                x, S, O = self.pcas[uid](X.to(self.device), O.to(self.device), Xix.to(self.device), return_O=True)
+                self.pcas[uid].to("cpu")
+
+                self.embed_norms[bsl, j] = torch.square(x).sum(dim=1)
+                self.embed_mahals[bsl, j] = torch.einsum("ni,nij,nj", x, torch.linalg.inv(S), x)
+                self.embed_overlaps[bsl, j] = O.sum(1)
+
+        # assert np.isfinite(self.chi_quantiles).all()
+        # self.old_labels = self.labels
+        # best_inds = np.nanargmax(self.logliks, axis=1)
+        # self.labels = unit_ids[best_inds]
+        # if outlier_quantile:
+        #     q = self.chi_quantiles[np.arange(best_inds.size), best_inds]
+        #     outliers = (q > outlier_quantile) | np.isnan(q)
+        #     print(f"Outlier fraction: {outliers.mean()}")
+        #     self.labels[outliers] = -1
+        # if min_size:
+        #     unit_ids, counts = np.unique(self.labels, return_counts=True)
+        #     small = np.flatnonzero(counts < min_size)
+        # if min_size and small.size:
+        #     print(f"{small.size} small units")
+        #     too_small = np.isin(self.labels, unit_ids[small])
+        #     self.labels[too_small] = -1
+        # self.reset()
+    
+    def pair_embedding_distances(self):
+        # return mahalanobis distance matrix between centroids?
+        # do we need to use "standard error" flavored covariances here (i.e n^{-1/2})
+        # for this to be in nice chi units?
+        # could also look at other distances? this one is not symmetric etc.
+        unit_ids = self.unit_ids
+        pair_embed_norms = np.full((unit_ids.size, unit_ids.size), np.nan)
+        pair_embed_mahals = np.full((unit_ids.size, unit_ids.size), np.nan)
+        overlaps = np.full((unit_ids.size, unit_ids.size), np.nan)
+
+        for i, uid in enumerate(tqdm(unit_ids, desc="Pairwise embed", **tqdm_kw)):
+            # self.pcas[uid].to(self.device)
+            # for j, ujd in enumerate(unit_ids[i + 1:], start=i + 1):
+            for j, ujd in enumerate(unit_ids):
+                x, S = self.pcas[uid](
+                    self.pcas[ujd].mbar[None], None, self.pcas[ujd].active_indices[None]
+                )
+                x = x[0]
+                S = S[0]
+                pair_embed_norms[i, j] = torch.square(x).sum()
+                pair_embed_mahals[i, j] = torch.einsum("i,ij,j", x, torch.linalg.inv(S), x)
+                overlaps[i, j] = np.intersect1d(
+                    self.pcas[uid].active_indices,
+                    self.pcas[ujd].active_indices,
+                ).size
+            # self.pcas[uid].to("cpu")
+
+        return pair_embed_norms, pair_embed_mahals, overlaps
+
+    def mahalanobis_reassign(self, batch_size=256, min_size=50, outlier_quantile=0.9, min_overlap=0.5):
         """Reassign points to new cluster labels
 
         TODO: currently looks at all clusters as candidates. let's not.
@@ -288,8 +395,11 @@ class SpikeLrGmm:
         unit_ids = self.unit_ids
         self.mahals = np.full((self.keepers.size, unit_ids.size), np.nan)
         self.nsamps = np.full((self.keepers.size, unit_ids.size), np.nan)
+        self.overlaps = np.full((self.keepers.size, unit_ids.size), np.nan)
         self.logliks = np.full((self.keepers.size, unit_ids.size), np.nan)
         self.chi_quantiles = np.full((self.keepers.size, unit_ids.size), np.nan)
+        for pca in self.pcas.values():
+            pca.to(self.device)
         for batch_start in trange(
             0, self.keepers.size, batch_size, desc="Reassign", **tqdm_kw
         ):
@@ -299,18 +409,40 @@ class SpikeLrGmm:
 
             X = self.tpca_features[bsl].reshape(nbatch, -1)
             chans = self.spike_static_channels[bsl]
-            Xix = torch.take_along_dim(self.full_index_set, chans, dim=1)
-            O = torch.logical_and(torch.isfinite(X), Xix < self.max_feature_ind)
+            Xix = F.pad(self.full_index_set, (0, 1, 0, 0), value=self.max_n_features)
+            Xix = Xix[None].broadcast_to(nbatch, *Xix.shape)
+            Xix = Xix[
+                torch.arange(nbatch)[:, None, None],
+                torch.arange(self.tpca_rank)[None, :, None],
+                chans[:, None, :],
+            ]
+            Xix = Xix.reshape(nbatch, -1)
+            O = torch.logical_and(torch.isfinite(X), Xix < self.max_n_features)
+            X = X.to(self.device)
+            O = O.to(self.device)
+            Xix = Xix.to(self.device)
 
+            results = []
             for j, uid in enumerate(unit_ids):
-                mahals, logliks, chi_qs, nobs = self.pcas[uid].predict(X, O, Xix)
-                self.mahals[bsl, j] = mahals
-                self.logliks[bsl, j] = logliks
-                self.nsamps[bsl, j] = nobs
-                self.chi_quantiles[bsl, j] = chi_qs
+                # self.pcas[uid].to(self.device)
+                res = self.pcas[uid].predict(
+                    X, O, Xix, return_overlaps=True
+                )
+                results.append(res)
+            for j, (mahals, logliks, chi_qs, nobs, overlaps) in enumerate(results):
+                # self.pcas[uid].to("cpu")
+                self.mahals[bsl, j] = mahals.numpy(force=True)
+                self.logliks[bsl, j] = logliks.numpy(force=True)
+                self.nsamps[bsl, j] = nobs.numpy(force=True)
+                self.overlaps[bsl, j] = overlaps.numpy(force=True)
+                self.chi_quantiles[bsl, j] = chi_qs.numpy(force=True)
 
+        for pca in self.pcas.values():
+            pca.to("cpu")
         # assert np.isfinite(self.chi_quantiles).all()
         self.old_labels = self.labels
+        if min_overlap:
+            self.logliks[self.overlaps < min_overlap] = -np.inf
         best_inds = np.nanargmax(self.logliks, axis=1)
         self.labels = unit_ids[best_inds]
         if outlier_quantile:
@@ -327,7 +459,7 @@ class SpikeLrGmm:
             self.labels[too_small] = -1
         self.reset()
 
-    def mahalanobis_matrix(self, sym_function=np.minimum):
+    def mahalanobis_matrix(self, sym_function=np.minimum, batch_size=8):
         # return mahalanobis distance matrix between centroids?
         # do we need to use "standard error" flavored covariances here (i.e n^{-1/2})
         # for this to be in nice chi units?
@@ -336,38 +468,51 @@ class SpikeLrGmm:
         mahal_dists = np.full((unit_ids.size, unit_ids.size), np.nan)
         pair_chi_quantiles = np.full((unit_ids.size, unit_ids.size), np.nan)
         pair_nsamps = np.full((unit_ids.size, unit_ids.size), np.nan)
-        rfull_centroids = np.stack(list(self.rfull_centroids.values()), axis=0)
-        mask = np.all(rfull_centroids == 0, axis=1)
-        rfull_centroids[np.broadcast_to(mask[:, None, :], rfull_centroids.shape)] = (
-            np.nan
-        )
-        Yinds = self.full_index_set.view(-1)[None].broadcast_to(
-            unit_ids.size, self.max_feature_ind
-        )
-        for j, uid in enumerate(tqdm(unit_ids, desc="Pairwise Mahalanobis", **tqdm_kw)):
-            mahals, logliks, chi_qs, nobs = self.pcas[uid].predict(
-                rfull_centroids, Onew=None, Y_indices_new=Yinds
-            )
+        overlaps = np.full((unit_ids.size, unit_ids.size), np.nan)
 
-            mahal_dists[:, j] = mahals
-            pair_nsamps[:, j] = nobs
-            pair_chi_quantiles[:, j] = chi_qs
+        for i, uid in enumerate(tqdm(unit_ids, desc="Pairwise Mahalanobis", **tqdm_kw)):
+            # self.pcas[uid].to(self.device)
+            # for j, ujd in enumerate(unit_ids[i + 1:], start=i + 1):
+            for j, ujd in enumerate(unit_ids):
+                mahals, logliks, chi_qs, nobs = self.pcas[uid].predict(
+                    self.pcas[ujd].mbar[None],
+                    Onew=None,
+                    Y_indices_new=self.pcas[ujd].active_indices[None],
+                )
+                mahal_dists[i, j] = mahals.numpy(force=True)
+                pair_nsamps[i, j] = nobs.numpy(force=True)
+                pair_chi_quantiles[i, j] = chi_qs.numpy(force=True)
+                overlaps[i, j] = np.intersect1d(
+                    self.pcas[uid].active_indices,
+                    self.pcas[ujd].active_indices,
+                ).size
+            # self.pcas[uid].to("cpu")
+
         mahal_dists = sym_function(mahal_dists, mahal_dists.T)
         pair_chi_quantiles = sym_function(pair_chi_quantiles, pair_chi_quantiles.T)
-        return mahal_dists, pair_chi_quantiles, pair_nsamps
+        return mahal_dists, pair_chi_quantiles, pair_nsamps, overlaps
 
     def mahalanobis_merge(
-        self, sym_function=np.minimum, link="complete", chi2_quantile=0.2
+        self, sym_function=np.maximum, link="complete", chi2_quantile=0.05
     ):
-        mahal_dists, pair_chi_quantiles, nsamps = self.mahalanobis_matrix(
+        mahal_dists, pair_chi_quantiles, nsamps, overlaps = self.mahalanobis_matrix(
             sym_function=sym_function
         )
+        from scipy.stats import chi2
+
+        chi_quantiles2 = chi2.cdf(mahal_dists, df=overlaps)
+
+        D = sym_function(chi_quantiles2, chi_quantiles2.T)
+        D[overlaps == 0] = 1
+        D = np.nan_to_num(D, nan=1.0)
+        np.fill_diagonal(D, 0)
+
         n_units = pair_chi_quantiles.shape[0]
 
         # hierarchical clustering
-        pdist = pair_chi_quantiles[np.triu_indices(pair_chi_quantiles.shape[0], k=1)]
+        pdist = D[np.triu_indices(D.shape[0], k=1)]
         Z = linkage(pdist, method=link)
-        new_labels = fcluster(Z, chi2_quantile, criterion="distance")
+        new_labels = fcluster(Z, D, criterion="distance")
 
         # update labels
         kept = np.flatnonzero(self.labels >= 0)
@@ -376,3 +521,33 @@ class SpikeLrGmm:
 
         self.reset()
         print(f"Merge: {n_units} -> {self.unit_ids.size}")
+
+    def pair_embed(self, uid, ujd):
+        nj = len(self.train_feats[ujd])
+        ni = len(self.train_feats[uid])
+        return dict(
+            ii=self.loadings[uid],
+            ij=self.pcas[uid](
+                self.train_feats[ujd].reshape(nj, -1),
+                None,
+                self.pcas[ujd].active_indices[None].broadcast_to(nj, -1).contiguous(),
+            )[0],
+            ij0=self.pcas[uid](
+                self.pcas[ujd].mbar[None], None, self.pcas[ujd].active_indices[None]
+            )[0][0],
+            ij0s=self.pcas[uid](
+                self.pcas[ujd].mbar[None], None, self.pcas[ujd].active_indices[None]
+            )[1][0],
+            jj=self.loadings[ujd],
+            ji=self.pcas[ujd](
+                self.train_feats[uid].reshape(ni, -1),
+                None,
+                self.pcas[uid].active_indices[None].broadcast_to(ni, -1).contiguous(),
+            )[0],
+            ji0=self.pcas[ujd](
+                self.pcas[uid].mbar[None], None, self.pcas[uid].active_indices[None]
+            )[0][0],
+            ji0s=self.pcas[ujd](
+                self.pcas[uid].mbar[None], None, self.pcas[uid].active_indices[None]
+            )[1][0],
+        )

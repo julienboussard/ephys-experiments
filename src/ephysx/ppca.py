@@ -3,6 +3,7 @@ from tqdm.auto import trange
 import torch
 import torch.nn.functional as F
 from torch import nn
+from dartsort.util import spiketorch
 
 
 class PPCA(torch.nn.Module):
@@ -77,7 +78,7 @@ class PPCA(torch.nn.Module):
 
 
 class VBPCA(torch.nn.Module):
-    def __init__(self, d, c, active_indices=None, max_feature_ind=None, learn_vy=True):
+    def __init__(self, d, c, active_indices=None, max_feature_ind=None, learn_vy=True, principal_transform=True):
         super().__init__()
         self.d = d
         self.c = c
@@ -91,10 +92,13 @@ class VBPCA(torch.nn.Module):
         self.vm = nn.Parameter(torch.ones(()), requires_grad=False)
         self.vwk = nn.Parameter(torch.ones(c), requires_grad=False)
         self.register_buffer("Ic", torch.eye(c))
-        self.active_indices = active_indices
         self.max_feature_ind = max_feature_ind
+        self.principal_transform = principal_transform
+        self.register_buffer("log2pi", torch.log(torch.tensor(2 * torch.pi)))
         if active_indices is not None:
-            self.active_indices = torch.tensor(active_indices)
+            self.register_buffer("active_indices", torch.as_tensor(active_indices))
+        else:
+            self.active_indices = active_indices
 
     def initialize_from(self, Y, O):
         with torch.no_grad():
@@ -106,29 +110,61 @@ class VBPCA(torch.nn.Module):
             s = s[: self.c]
             self.wbar.copy_(vh.T)
 
-    def forward(self, Y, O=None, Y_indices=None):
+    def forward(self, Y, O=None, Y_indices=None, batch_size=256, return_O=False):
         if O is None:
             O = torch.isfinite(Y)
         O_ = O.to(self.wbar)
+        del O
         Y = torch.nan_to_num(Y)
         if Y_indices is not None:
             # re-order O, Y s.t. Y_indices matches active_indices
-            rel_inds, not_found = searchfor(self.active_indices, Y_indices, invalid=0)
+            
+            # get my active indices in y's index space
+            # when going forward, we want indices into Y which conform it to my index set
+            rel_inds, not_found = searchfor(Y_indices, self.active_indices, invalid=0, shape="right")
+            # Ys = torch.zeros((len(Y), self.d + 1), dtype=Y.dtype, device=Y.device)
+            # Os = torch.zeros((len(Y), self.d + 1), dtype=O_.dtype, device=O_.device)
+            # Ys.scatter_(dim=1, index=rel_inds, src=Y)
+            # Os.scatter_(dim=1, index=rel_inds, src=O_)
+            # Y = Ys[:, :self.d]
+            # O_ = Os[:, :self.d]
             Y = torch.take_along_dim(Y, rel_inds, dim=1)
             O_ = torch.take_along_dim(O_, rel_inds, dim=1)
             O_[not_found] = 0
             pass
 
-        OwwSw = torch.baddbmm(self.Sigmaw, self.wbar[:, :, None], self.wbar[:, None, :])
-        OwwSw = (O_ @ OwwSw.reshape(self.d, self.c * self.c)).reshape(
-            O.shape[0], self.c, self.c
+        xbarn = torch.empty(
+            (len(Y), self.c), dtype=Y.dtype, layout=Y.layout, device=Y.device
         )
-        Sigma_xn = self.vy * torch.linalg.inv(self.vy * self.Ic[None] + OwwSw)
-        xbarn = torch.einsum(
-            "nlk,ni,ik,ni->nl", Sigma_xn / self.vy, O_, self.wbar, Y - self.mbar
+        Sigma_xn = torch.empty(
+            (len(Y), self.c, self.c), dtype=Y.dtype, layout=Y.layout, device=Y.device
         )
 
+        OwwSw0 = torch.baddbmm(
+            self.Sigmaw, self.wbar[:, :, None], self.wbar[:, None, :]
+        )
+        OwwSw0 = OwwSw0.reshape(self.d, self.c * self.c)
+        for batch_start in range(0, len(Y), batch_size):
+            batch_end = min(batch_start + batch_size, len(Y))
+            bsl = slice(batch_start, batch_end)
+            bn = batch_end - batch_start
+            OwwSw = (O_[bsl] @ OwwSw0).reshape(
+                bn, self.c, self.c
+            )
+            bS = self.vy * torch.linalg.inv(self.vy * self.Ic[None] + OwwSw)
+            Sigma_xn[bsl] = bS
+            xbarn[bsl] = torch.einsum(
+                "nlk,ni,ik,ni->nl", bS / self.vy, O_[bsl], self.wbar, Y[bsl] - self.mbar
+            )
+
+        if return_O:  
+            return xbarn, Sigma_xn, O_
         return xbarn, Sigma_xn
+    
+    def apply_principal_transform(self, x, Sigmax):
+        mu = x.mean(0)
+        x = x - mu
+        
 
     def m_step(self, Y, O, xbarn, Sigma_xn):
         O_ = O.to(self.wbar)
@@ -229,45 +265,55 @@ class VBPCA(torch.nn.Module):
             Lambda_Ynew = torch.diag_embed(diag_inv)
             inner_prod = torch.einsum("ik,ni,il->nkl", self.wbar, diag_inv, self.wbar)
             inner = Lambda_xnew + inner_prod
-            Lambda_Ynew.sub_(torch.einsum("ni,ik,nkl,jl,nj", diag_inv, self.wbar, inner, self.wbar, diag_inv))
+            Lambda_Ynew.sub_(
+                torch.einsum(
+                    "ni,ik,nkl,jl,nj", diag_inv, self.wbar, inner, self.wbar, diag_inv
+                )
+            )
 
-            log_cov_det = torch.logdet(Lambda_xnew) + torch.logdet(inner_prod) + torch.log(diag).sum(1)
-            return Onew, Ynewhat, Sigma_Ynew, Lambda_Ynew, log_cov_det
+            log_prec_det = (
+                torch.logdet(Lambda_xnew)
+                + torch.logdet(inner_prod)
+                + torch.log(diag).sum(1)
+            )
+            return Onew, Ynewhat, Sigma_Ynew, Lambda_Ynew, log_prec_det
 
         # reverse lookup
-        my_chans_to_new, my_chans_found = searchfor(Y_indices_new, self.active_indices, invalid=self.d)
-        my_chans_to_new[Y_indices_new == self.max_feature_ind] = self.d + 1
+        # when coming back from my index set into Y's, we want
+        # indices which conform my index set to Y indices
+        my_chans_to_new, my_chans_found = searchfor(
+            Y_indices_new, self.active_indices, invalid=0, shape="right"
+        )
+        found = my_chans_found.to(self.mbar)
         Nnew = len(Ynew)
-        mbar_pad = F.pad(self.mbar, (0, 2))
-        mbar = torch.take_along_dim(
-            mbar_pad[None].broadcast_to(Nnew, self.d),
-            my_chans_to_new,
-            dim=1,
-        )
-        wbar_pad = F.pad(self.wbar, (0, 2, 0, 0))
-        wbar = torch.take_along_dim(
-            wbar_pad[None].broadcast_to(Nnew, self.d, self.c),
-            my_chans_to_new,
-            dim=1,
-        )
-        Sigmaw_pad = F.pad(self.Sigmaw, (0, 2, 0, 0, 0, 0))
-        Sigmaw_pad[self.d] = self.vwk * torch.eye(self.c)
-        Sigmaw_pad[self.d + 1] = torch.eye(self.c)
-        Sigmaw = torch.take_along_dim(
-            Sigmaw_pad[None].broadcast_to(Nnew, self.d, self.c, self.c),
-            my_chans_to_new,
-            dim=1,
-        )
-        mtilde_pad = F.pad(self.mtilde, (0, 2))
-        mtilde_pad[self.d] = self.vm
-        mtilde_pad[self.d + 1] = 1.0
-        mtilde = torch.take_along_dim(
-            mtilde_pad[None].broadcast_to(Nnew, self.d),
-            my_chans_to_new,
-            dim=1,
-        )
 
-        Ynewhat = torch.baddbmm(mbar, xbarnew, wbar.mT)
+        mbar_fill = self.mbar[None].broadcast_to(Nnew, *self.mbar.shape)
+        mbar = torch.zeros_like(Ynew)
+        mbar.scatter_(src=mbar_fill, dim=1, index=my_chans_to_new)
+        
+        # wbar_fill = F.pad(self.wbar, (0, 0, 0, 2))
+        # wbar_fill = wbar_fill[None].broadcast_to(Nnew, self.d + 2, self.c)
+        wbar_fill = self.wbar[None] * found[..., None]
+        wbar = torch.zeros((*Ynew.shape, self.c), dtype=Ynew.dtype, device=Ynew.device)
+        Nix = torch.arange(Nnew)
+        cix = torch.arange(self.c)
+        wbar[Nix[:, None], my_chans_to_new[:, :]].copy_(wbar_fill)
+        
+        Sigmaw_fill = self.Sigmaw[None] * found[..., None, None]
+        Sigmaw = torch.zeros((*Ynew.shape, self.c, self.c), dtype=Ynew.dtype, device=Ynew.device)
+        # fill vwks for observed chans where model does not overlap
+        # fill eyes for nonexistent chans so that determinants dont get messed up
+        Sigmaw.diagonal(dim1=-2, dim2=-1).copy_(torch.where(Onew[..., None], self.vwk, 1.0))
+        # add in so that the zeros don't overwrite ^ where there are no observations
+        Sigmaw[Nix[:, None], my_chans_to_new[:, :]].add_(Sigmaw_fill)
+        
+        mtilde_fill = self.mtilde[None] * found
+        mtilde = torch.zeros_like(Ynew)
+        mtilde[Onew] = self.vm
+        mtilde[Nix[:, None], my_chans_to_new[:, :]].add_(mtilde_fill)
+        mtilde[torch.logical_not(Onew)] = 1.0
+
+        Ynewhat = torch.baddbmm(mbar[:, None], xbarnew[:, None], wbar.mT)[:, 0]
         wSxw = torch.einsum("nik,nkl,njl->nij", wbar, Sigma_xnew, wbar)
         SwSx = torch.einsum("nkl,nikl->ni", Sigma_xnew, Sigmaw)
         Sigma_Ynew = wSxw
@@ -279,35 +325,145 @@ class VBPCA(torch.nn.Module):
         Lambda_Ynew = torch.diag_embed(diag_inv)
         inner_prod = torch.einsum("nik,ni,nil->nkl", wbar, diag_inv, wbar)
         inner = Lambda_xnew + inner_prod
-        Lambda_Ynew.sub_(torch.einsum("ni,nik,nkl,njl,nj", diag_inv, wbar, inner, wbar, diag_inv))
+        Lambda_Ynew.sub_(
+            torch.einsum("ni,nik,nkl,njl,nj", diag_inv, wbar, inner, wbar, diag_inv)
+        )
+        
+        # print(f"{Lambda_xnew.shape=}")
+        # print(f"{torch.logdet(Lambda_xnew)=}")
+        # print(f"{inner_prod.shape=}")
+        # print(f"{torch.logdet(inner_prod)=}")
+        # inner_prod_det = torch.einsum("nik,ni,nil->ni", wbar, diag_inv, wbar)
+        ipsvs = torch.linalg.svdvals(inner_prod)
+        # print(f"{ipsvs=}")
 
-        log_cov_det = torch.logdet(Lambda_xnew) + torch.logdet(inner_prod) + torch.log(diag).sum(1)
+        log_prec_det = (
+            torch.logdet(Lambda_xnew)
+            + torch.log(torch.where(ipsvs > 0, ipsvs, 1.0)).sum()
+            + torch.log(diag).sum(1)
+        )
 
-        return Onew, Ynewhat, Sigma_Ynew, Lambda_Ynew, log_cov_det
+        return Onew, Ynewhat, Sigma_Ynew, Lambda_Ynew, log_prec_det
+    
+    
+    def predictive_dists_lowrank(self, Ynew, Onew=None, Y_indices_new=None):
+        if Onew is None:
+            Onew = torch.isfinite(Ynew)
+
+        # posteriors for xs, holding everything fixed
+        # not sure how kosher this is.
+        xbarnew, Sigma_xnew = self(Ynew, Onew, Y_indices_new)
+        assert Y_indices_new is not None
+
+        # reverse lookup
+        # when coming back from my index set into Y's, we want
+        # indices which conform my index set to Y indices
+        my_chans_to_new, my_chans_found = searchfor(
+            Y_indices_new, self.active_indices, invalid=0, shape="right"
+        )
+        found = my_chans_found.to(self.mbar)
+        Nnew = len(Ynew)
+
+        mbar_fill = self.mbar[None].broadcast_to(Nnew, *self.mbar.shape)
+        mbar = torch.zeros_like(Ynew)
+        mbar.scatter_(src=mbar_fill, dim=1, index=my_chans_to_new)
+        
+        # wbar_fill = F.pad(self.wbar, (0, 0, 0, 2))
+        # wbar_fill = wbar_fill[None].broadcast_to(Nnew, self.d + 2, self.c)
+        wbar_fill = self.wbar[None] * found[..., None]
+        wbar = torch.zeros((*Ynew.shape, self.c), dtype=Ynew.dtype, device=Ynew.device)
+        Nix = torch.arange(Nnew)
+        cix = torch.arange(self.c)
+        wbar[Nix[:, None], my_chans_to_new[:, :]].copy_(wbar_fill)
+        
+        Sigmaw_fill = self.Sigmaw[None] * found[..., None, None]
+        Sigmaw = torch.zeros((*Ynew.shape, self.c, self.c), dtype=Ynew.dtype, device=Ynew.device)
+        # fill vwks for observed chans where model does not overlap
+        # fill eyes for nonexistent chans so that determinants dont get messed up
+        Sigmaw.diagonal(dim1=-2, dim2=-1).copy_(torch.where(Onew[..., None], self.vwk, 1.0))
+        # add in so that the zeros don't overwrite ^ where there are no observations
+        Sigmaw[Nix[:, None], my_chans_to_new[:, :]].add_(Sigmaw_fill)
+        
+        mtilde_fill = self.mtilde[None] * found
+        mtilde = torch.zeros_like(Ynew)
+        mtilde[Onew] = self.vm
+        mtilde[Nix[:, None], my_chans_to_new[:, :]].add_(mtilde_fill)
+        mtilde[torch.logical_not(Onew)] = 1.0
+
+        Ynewhat = torch.baddbmm(mbar[:, None], xbarnew[:, None], wbar.mT)[:, 0]
+        # wSxw = torch.einsum("nik,nkl,njl->nij", wbar, Sigma_xnew, wbar)
+        SwSx = torch.einsum("nkl,nikl->ni", Sigma_xnew, Sigmaw)
+        # Sigma_Ynew = wSxw
+        # Sigma_Ynew.diagonal(dim1=-2, dim2=-1).add_(diag)
+
+        Lambda_xnew = torch.linalg.inv(Sigma_xnew)
+        diag = self.vy + SwSx + mtilde
+        Lambda_diag = torch.reciprocal(diag)
+        
+        inner_prod = torch.einsum("nik,ni,nil->nkl", wbar, Lambda_diag, wbar)
+        inner = Lambda_xnew + inner_prod
+        Lambda_left = torch.einsum("ni,nik,nkl->nil", Lambda_diag, wbar, inner)
+        Lambda_right = torch.einsum("nik,ni->nki", wbar, Lambda_diag)
+        
+        ipsvs = torch.linalg.svdvals(inner)
+
+        log_cov_det = (
+            torch.logdet(Sigma_xnew)
+            + torch.log(torch.where(ipsvs > 0, ipsvs, 1.0)).sum()
+            + torch.log(diag).sum(1)
+        )
+
+        return Onew, Ynewhat, Lambda_left, Lambda_diag, Lambda_right, log_cov_det 
 
         # dists = torch.distributions.MultivariateNormal(
         #     Ynewhat, covariance_matrix=Sigma_Ynew
         # )
         # return dists
 
-    def predict(self, Ynew, Onew=None, Y_indices_new=None):
-        Onew, Ynewhat, Sigma_Ynew, Lambda_Ynew, log_cov_det = self.predictive_dists(Ynew, Onew, Y_indices_new)
+    def predict(self, Ynew, Onew=None, Y_indices_new=None, return_overlaps=False):
+        # Onew, Ynewhat, Sigma_Ynew, Lambda_Ynew, log_prec_det = self.predictive_dists(
+        #     Ynew, Onew, Y_indices_new
+        # )
+        if return_overlaps:
+            old_counts = Onew.sum(1)
+        Onew, Ynewhat, Lambda_left, Lambda_diag, Lambda_right, log_cov_det = self.predictive_dists_lowrank(
+            Ynew, Onew, Y_indices_new
+        )
+        # print(f"{log_prec_det=}")
         dY = torch.nan_to_num(Ynew - Ynewhat)
-        mahals = torch.einsum("ni,nij,nj->n", dY, Lambda_Ynew, dY)
+        mahals = (
+            torch.einsum("ni,ni,ni->n", dY, Lambda_diag, dY)
+            - torch.einsum("ni,nik,nkj,nj->n", dY, Lambda_left, Lambda_right, dY)
+        )
         nobs = Onew.sum(1)
-        logliks = -0.5 * (log_cov_det + nobs * torch.log(2 * torch.pi)) - 0.5 * mahals
+        logliks = - 0.5 * (log_cov_det + nobs * self.log2pi) - 0.5 * mahals
         chi_qs = torch.distributions.Chi2(nobs).cdf(mahals)
+        if return_overlaps:
+            return mahals, logliks, chi_qs, nobs, nobs / old_counts
+            
         return mahals, logliks, chi_qs, nobs
 
 
-def searchfor(indices, new_indices, invalid=0):
+def searchfor(indices, new_indices, invalid=0, shape="min"):
+    """
+    searchsorted(indices, new_indices) returns indices of indices.
+    """
     if new_indices.ndim == 1:
-        new_indices = torch.broadcast_to(new_indices[None], indices.shape).contiguous()
-    assert new_indices.shape[-1] == indices.shape[-1]
+        new_indices = torch.broadcast_to(new_indices[None], (indices.shape[0], -1)).contiguous()
     ix = torch.searchsorted(indices, new_indices)
-    ix[ix == new_indices.shape[1]] = 0
+    ix[ix == indices.shape[-1]] = 0
     if indices.ndim == 1:
         not_found = indices[ix] != new_indices
     else:
         not_found = torch.take_along_dim(indices, ix, dim=1) != new_indices
-    return torch.where(not_found, invalid, ix), not_found
+    ixs = torch.where(not_found, invalid, ix)
+    if shape == "min" and indices.shape[-1] != new_indices.shape[-1]:
+        min_size = min(indices.shape[-1], new_indices.shape[-1])
+        keep_me = torch.sort(not_found.to(torch.int8), stable=True)
+        assert torch.take_along_dim(not_found, keep_me.indices[..., min_size:], dim=1).all()
+        keep_me = keep_me.indices[..., :min_size]
+        ixs = torch.take_along_dim(ixs, keep_me, dim=1)
+        not_found = torch.take_along_dim(not_found, keep_me, dim=1)
+        return ixs, not_found, keep_me
+        
+    return ixs, not_found
