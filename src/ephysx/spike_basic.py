@@ -67,7 +67,6 @@ class BasicSpikePCAClusterer(nn.Module):
         sorting,
         motion_est=None,
         rank=5,
-        projection_dim=None,
         svd_atol=0.01,
         svd_max_iter=250,
         svd_n_oversamples=15,
@@ -85,11 +84,17 @@ class BasicSpikePCAClusterer(nn.Module):
         centered=True,
         whiten_input=False,
         in_memory=True,
+        split_rank=2,
+        merge_rank=1,
+        reassign_rank=1,
+        split_impute_iters=5,
+        merge_impute_iters=5,
+        reassign_impute_iters=5,
+        split_on_train=False,
         rg=0,
     ):
         super().__init__()
         self.rank = rank
-        self.projection_dim = None
         self.svd_atol = svd_atol
         self.svd_max_iter = svd_max_iter
         self.rg = np.random.default_rng(rg)
@@ -105,6 +110,13 @@ class BasicSpikePCAClusterer(nn.Module):
         self.centered = centered
         self.spike_r2_threshold = spike_r2_threshold
         self.embedding_damping = embedding_damping
+        self.split_rank = split_rank
+        self.merge_rank = merge_rank
+        self.reassign_rank = reassign_rank
+        self.split_impute_iters = split_impute_iters
+        self.split_on_train = split_on_train
+        self.merge_impute_iters = merge_impute_iters
+        self.reassign_impute_iters = reassign_impute_iters
 
         self.labels, self.data = _load_data(
             sorting,
@@ -127,6 +139,7 @@ class BasicSpikePCAClusterer(nn.Module):
         self.register_buffer("components", torch.zeros((U, self.dim_input, self.rank)))
         self.register_buffer("mean", torch.zeros((U, self.dim_input)))
         self.register_buffer("svs", torch.zeros((U, self.rank)))
+        self.channel_had_observations = np.zeros((U, self.data.n_chans_cluster), dtype=bool)
         self.wf_to_pc_reindexers = get_channel_structures(
             self.data.cluster_channel_index
         )
@@ -148,6 +161,7 @@ class BasicSpikePCAClusterer(nn.Module):
         self.components.resize_(U, *self.components.shape[1:])
         self.svs.resize_(U, *self.svs.shape[1:])
         self.train_loadings.resize(U, *self.train_loadings.shape[1:])
+        self.channel_had_observations.resize(U, *self.channel_had_observations.shape[1:])
         self.train_spike_indices.resize(U, *self.train_spike_indices.shape[1:])
         self.snrs.resize(U, *self.snrs.shape[1:])
         self.main_channels.resize(U)
@@ -160,6 +174,7 @@ class BasicSpikePCAClusterer(nn.Module):
         self.components[:k] = self.components[oldix] + 0
         self.svs[:k] = self.svs[oldix] + 0
         self.train_loadings[:k] = self.train_loadings[oldix] + 0
+        self.channel_had_observations[:k] = self.channel_had_observations[oldix] + 0
         self.main_channels[:k] = self.main_channels[oldix] + 0
         self.main_channels[k:] = self.data.n_reg_chans
         self.snrs[:k] = self.snrs[oldix] + 0
@@ -218,17 +233,21 @@ class BasicSpikePCAClusterer(nn.Module):
         uids = self.unit_ids()
         return uids[self.needs_split[: len(uids)]]
 
-    def unit_channel_snrs(self, unit_ids=None):
+    def unit_channel_snrs(self, unit_ids=None, no_count=False):
         if unit_ids is None:
             unit_ids = self.unit_ids()
         snrs = torch.zeros((unit_ids.size, self.data.n_reg_chans))
         for j, uid in enumerate(unit_ids):
             avs = self.data.static_amp_vecs[self.labels == uid]
-            count = torch.sqrt(torch.isfinite(avs).sum(0))
+            if no_count:
+                count = 1
+            else:
+                count = torch.sqrt(torch.isfinite(avs).sum(0))
             snrs[j] = torch.nan_to_num(torch.nanmean(avs, dim=0)) * count
         return snrs.numpy(force=True)
 
     def m_step(self, unit_ids=None, force=False):
+        #TODO: nans!!!!
         if unit_ids is None:
             if force:
                 unit_ids = self.unit_ids()
@@ -249,108 +268,101 @@ class BasicSpikePCAClusterer(nn.Module):
             self.snrs[batch] = self.unit_channel_snrs(batch)
             self.main_channels[batch] = self.snrs[batch].argmax(1)
 
-            X, missing, empty, inds, n_wfs_fit = self.get_training_data(
+            X, missing, empty, inds, n_wfs_fit, channel_had_observations = self.get_training_data(
                 batch, n_wfs_fit=n_wfs_fit, train_buffer=train_buffer[: len(batch)]
             )
-            if self.projection_dim:
-                # todo... should other stuff be done in the projection space?
-                projs, _, projection, _ = fit_pcas(
-                    X,
-                    missing,
-                    empty,
-                    self.projection_dim,
-                    max_iter=self.svd_max_iter,
-                    n_oversamples=self.svd_n_oversamples,
-                    atol=self.svd_atol,
-                    show_progress=False,
-                    centered=False,
-                )
-                proj_loadings, proj_mean, proj_components, svs = fit_pcas(
-                    projs,
-                    missing,
-                    empty,
-                    self.rank,
-                    max_iter=self.svd_max_iter,
-                    n_oversamples=self.svd_n_oversamples,
-                    atol=self.svd_atol,
-                    show_progress=False,
-                    centered=self.centered,
-                )
-                loadings = torch.bmm(proj_loadings, projection.mT)
-                mean = torch.bmm(proj_mean, projection.mT)
-                components = torch.bmm(proj_components, projection.mT)
-            else:
-                loadings, mean, components, svs = fit_pcas(
-                    X,
-                    missing,
-                    empty,
-                    self.rank,
-                    max_iter=self.svd_max_iter,
-                    n_oversamples=self.svd_n_oversamples,
-                    atol=self.svd_atol,
-                    show_progress=False,
-                    centered=self.centered,
-                )
+            loadings, mean, components, svs = fit_pcas(
+                X,
+                missing,
+                empty,
+                self.rank,
+                max_iter=self.svd_max_iter,
+                n_oversamples=self.svd_n_oversamples,
+                atol=self.svd_atol,
+                show_progress=False,
+                centered=self.centered,
+            )
             self.mean[batch] = mean
             self.svs[batch] = svs
+            self.channel_had_observations[batch] = channel_had_observations
             self.components[batch] = components
             self.train_loadings[batch, :n_wfs_fit] = loadings.numpy(force=True)
             self.train_spike_indices[batch, n_wfs_fit:] = -1
             self.train_spike_indices[batch, :n_wfs_fit] = inds
             self.needs_fit[batch] = False
 
-    def embed_spikes(self, unit_id, waveforms, rel_ix, return_X=False, damping=None):
+    def embed_spikes(self, unit_id, waveforms, rel_ix, return_X=False, damping=None, impute_iters=0, rank=None):
         n, r, c = waveforms.shape
         m = self.mean[unit_id]
         # intialize empties with the means
-        # TODO: impute here?
+        # TODO: only impute rows with empties
         X = F.pad(m.reshape(r, self.data.n_chans_cluster), (0, 1))
         X = X[None].broadcast_to(n, *X.shape).contiguous()
-        # X = torch.zeros(n, r, self.data.n_chans_cluster + 1, device=self.mean.device)
-        rel_ix = rel_ix[:, None, :].broadcast_to((n, r, rel_ix.shape[-1]))
-        X.scatter_(src=waveforms, dim=2, index=rel_ix)
-        X = X[..., :-1].reshape(n, self.dim_input)
+        rel_ix_scatter = rel_ix[:, None, :].broadcast_to((n, r, rel_ix.shape[-1]))
         W = self.components[unit_id]
-        embeds = (X - m) @ W
+        
+        X.scatter_(src=waveforms, dim=2, index=rel_ix_scatter)
+        Xflat = X[..., :-1].reshape(n, self.dim_input)
+        embeds = (Xflat - m) @ W
+        for i in range(impute_iters):
+            X = self.reconstruct_spikes(
+                unit_id, embeds, rel_ix, return_rel=True
+            )
+            X.scatter_(src=waveforms, dim=2, index=rel_ix_scatter)
+            Xflat = X[..., :-1].reshape(n, self.dim_input)
+            embeds = (Xflat - m) @ W
+    
         if damping is None:
             damping = self.embedding_damping
+
         if damping:
             nu = (self.train_spike_indices[unit_id] >= 0).sum()
             sds = self.svs[unit_id] / float(np.sqrt(nu))
             damp = torch.square(sds / (sds + self.embedding_damping))
             embeds *= damp
+        
+        if rank is not None:
+            embeds[:, rank:] = 0.0
+
         if return_X:
             return X, embeds
+
         return embeds
 
-    def embed_at(self, unit_id, spike_indices, return_X=False):
-        overlaps, rel_ix = self.spike_overlaps(unit_id, which_spikes=spike_indices)
+    def embed_at(
+        self,
+        unit_id,
+        spike_indices,
+        overlaps=None,
+        rel_ix=None,
+        return_X=False,
+        impute_iters=0,
+        damping=None,
+        rank=None
+    ):
+        # todo: this should call embed_spikes
+        if overlaps is None:
+            overlaps, rel_ix = self.spike_overlaps(unit_id, which_spikes=spike_indices)
         rel_ix = torch.tensor(rel_ix, device=self.mean.device)
         waveforms = self.data.getwf(spike_indices)
         waveforms = torch.tensor(waveforms, device=self.mean.device)
+        
+        return overlaps, self.embed_spikes(
+            unit_id, waveforms, rel_ix, damping=damping, impute_iters=impute_iters, rank=rank
+        )
 
-        n, r, c = waveforms.shape
-        m = self.mean[unit_id]
-        # intialize empties with the means
-        # TODO: impute here?
-        X = F.pad(m.reshape(r, self.data.n_chans_cluster), (0, 1))
-        X = X[None].broadcast_to(n, *X.shape).contiguous()
-        # X = torch.zeros(n, r, self.data.n_chans_cluster + 1, device=self.mean.device)
-        rel_ix = rel_ix[:, None, :].broadcast_to((n, r, self.data.n_chans_cluster))
-        X.scatter_(src=waveforms, dim=2, index=rel_ix)
-        X = X[..., :-1].reshape(n, self.dim_input)
-        W = self.components[unit_id]
-        embeds = (X - m) @ W
-        return overlaps, embeds
-
-    def reconstruct_spikes(self, unit_id, loadings, rel_ix):
+    def reconstruct_spikes(
+        self, unit_id, loadings, rel_ix, return_rel=False, recons_rel=None
+    ):
         n = len(loadings)
         r = self.data.tpca_rank
         recons_rel = torch.addmm(
-            self.mean[unit_id], loadings, self.components[unit_id].T
+            self.mean[unit_id], loadings, self.components[unit_id].T, out=recons_rel
         )
         recons_rel = recons_rel.reshape(n, -1, self.data.n_chans_cluster)
         recons_rel = F.pad(recons_rel, (0, 1))
+        if return_rel:
+            return recons_rel
         rel_ix = rel_ix[:, None, :].broadcast_to((n, r, rel_ix.shape[-1]))
         return torch.gather(recons_rel, dim=2, index=rel_ix)
 
@@ -398,7 +410,7 @@ class BasicSpikePCAClusterer(nn.Module):
             overlaps[uid] = (rel_ix < self.data.n_chans_cluster).sum() / unc
 
             rel_ix = torch.as_tensor(rel_ix[None])
-            x, e = self.embed_spikes(uid, torch.tensor(wf[None]), rel_ix, return_X=True)
+            x, e = self.embed_spikes(uid, torch.tensor(wf[None]), rel_ix, return_X=True, impute_iters=self.reassign_impute_iters)
             wfs_rel[uid] = x[0].reshape(wfs_rel[uid].shape)
             embeds[uid] = e[0]
             recons[uid] = self.reconstruct_spikes(
@@ -415,9 +427,11 @@ class BasicSpikePCAClusterer(nn.Module):
             errs=np.nansum(np.square(wf[None] - recons), axis=(1, 2)),
         )
 
-    def calc_errors(self, kind="unexplained_var", centroid_only=False, sparse=False):
+    def calc_errors(self, kind="unexplained_var", centroid_only=False, sparse=False, rank=None):
         unit_ids = self.unit_ids()
         n_units = unit_ids.size
+        if rank is None:
+            rank = self.reassign_rank
 
         # this is typically sparse
         if sparse:
@@ -451,7 +465,7 @@ class BasicSpikePCAClusterer(nn.Module):
                     err = crels
                 else:
                     wfs = torch.from_numpy(wfs).to(self.mean)
-                    loadings = self.embed_spikes(uid, wfs, rel_ix[bs:be])
+                    loadings = self.embed_spikes(uid, wfs, rel_ix[bs:be], impute_iters=self.reassign_impute_iters, rank=rank)
                     recons = self.reconstruct_spikes(uid, loadings, rel_ix[bs:be])
                     err = recons
 
@@ -543,9 +557,9 @@ class BasicSpikePCAClusterer(nn.Module):
 
         return mahals, logliks, chis
 
-    def reassign(self, kind="unexplained_var"):
+    def reassign(self, kind="unexplained_var", centroid_only=False):
         if kind.endswith("unexplained_var") or kind.endswith("reconstruction"):
-            centroid_only = kind.startswith("centroid")
+            centroid_only = centroid_only or (kind.startswith("centroid"))
             max_err, errs, nobs = self.calc_errors(
                 kind=kind.removeprefix("centroid"),
                 centroid_only=centroid_only,
@@ -569,7 +583,7 @@ class BasicSpikePCAClusterer(nn.Module):
                 uvs = errs[new_labels[kept], kept]
                 new_labels[kept[uvs > uv_thresh]] = -1
         elif kind.endswith("likelihood"):
-            centroid_only = kind == "centroidlikelihood"
+            centroid_only = centroid_only or (kind == "centroidlikelihood")
             mahals, logliks, chis = self.calc_liks(
                 sparse=True, centroid_only=centroid_only
             )
@@ -584,7 +598,7 @@ class BasicSpikePCAClusterer(nn.Module):
             )
             self.chis = chis
 
-        print(f"{(new_labels < 0).mean()*100=:0.1f}% unmatched.")
+        print(f"{(new_labels < 0).mean()*100:0.1f}% of spikes unmatched after reassignment.")
         self.labels = new_labels
         self.drop_small()
         self.needs_fit[: len(self.unit_ids())] = 1
@@ -593,6 +607,7 @@ class BasicSpikePCAClusterer(nn.Module):
         unit_ids = self.unit_ids()
         orig_nunits = len(unit_ids)
         i = 1
+        self.needs_split[: len(self.unit_ids())] = True
         while self.needs_split.any():
             ids_to_refit = []
             ids_to_resplit = []
@@ -628,22 +643,44 @@ class BasicSpikePCAClusterer(nn.Module):
         allow_single_cluster_outlier_removal=True,
     ):
         """Split the unit. Reassign to sub-units. Update state variables."""
-        #TODO set rank, embed full unit
+        # TODO set rank, embed full unit
         # run the clustering
-        X = self.train_loadings[unit_id]
-        in_unit = self.train_spike_indices[unit_id]
-        valid = np.flatnonzero(in_unit >= 0)
-        in_unit = in_unit[valid]
+        if self.split_on_train:
+            X = self.train_loadings[unit_id]
+            in_unit = self.train_spike_indices[unit_id]
+            valid = np.flatnonzero(in_unit >= 0)
+            in_unit = in_unit[valid]
+            X = X[valid, : self.split_rank]
+        else:
+            in_unit = np.flatnonzero(self.labels == unit_id)
+            overlaps, rel_ix = self.spike_overlaps(unit_id, which_spikes=in_unit)
+            valid = overlaps >= self.min_overlap
+            in_unit = in_unit[valid]
+            overlaps = overlaps[valid]
+            rel_ix = rel_ix[valid]
+            overlaps, X = self.embed_at(
+                unit_id,
+                in_unit,
+                overlaps=overlaps,
+                rel_ix=rel_ix,
+                impute_iters=self.split_impute_iters,
+            )
+            X = X[:, : self.split_rank].numpy(force=True)
+
         # assert np.isin(in_unit, np.flatnonzero(self.labels == unit_id)).all()
-        X = X[valid, :rank]
-        split_labels = density.density_peaks_clustering(
-            X,
-            sigma_local=sigma_local,
-            n_neighbors_search=n_neighbors_search,
-            remove_clusters_smaller_than=max(
-                self.min_unit_size, remove_clusters_smaller_than
-            ),
-        )
+        try:
+            split_labels = density.density_peaks_clustering(
+                X,
+                sigma_local=sigma_local,
+                n_neighbors_search=n_neighbors_search,
+                remove_clusters_smaller_than=max(
+                    self.min_unit_size, remove_clusters_smaller_than
+                ),
+            )
+        except ValueError as e:
+            print(e)
+            print(f"{X[:10]=}")
+            return [], []
         split_units_full, counts = np.unique(split_labels, return_counts=True)
         split_units = split_units_full[split_units_full >= 0]
         if split_units.size == split_units_full.size == 1:
@@ -715,6 +752,7 @@ class BasicSpikePCAClusterer(nn.Module):
 
         missing[empty] = 0
         X = torch.from_numpy(X[..., :-1])
+        channel_had_observations = np.logical_not(missing[..., :-1].all(1))
         missing = torch.from_numpy(missing[..., :-1])
         missing = missing[..., None, :].broadcast_to(X.shape)
         X = X.reshape(n_units, n_wfs_fit, -1)
@@ -725,7 +763,7 @@ class BasicSpikePCAClusterer(nn.Module):
         missing = missing.to(self.mean.device)
         empty = empty.to(self.mean.device)
 
-        return X, missing, empty, spike_indices, n_wfs_fit
+        return X, missing, empty, spike_indices, n_wfs_fit, channel_had_observations
 
     def spike_overlaps(self, unit_ids=None, which_spikes=None):
         """
@@ -779,6 +817,11 @@ class BasicSpikePCAClusterer(nn.Module):
 
         main_channels_b = self.main_channels[unit_ids_b]
         static_channels_b = self.data.cluster_channel_index[main_channels_b]
+        static_channels_b = np.where(
+            self.channel_had_observations[unit_ids_b],
+            static_channels_b,
+            self.data.n_reg_chans,
+        )
 
         rel_ix = np.take_along_axis(
             unit_reindexers_a[:, None],
@@ -799,7 +842,7 @@ class BasicSpikePCAClusterer(nn.Module):
         link="complete",
         centroid_only=False,
     ):
-        dist_res = self.centroid_dists(kind, centroid_only=centroid_only)
+        dist_res = self.centroid_dists(kind, centroid_only=centroid_only, rank=self.merge_rank)
         D = dist_res[measure]
         D = sym_function(D, D.T)
         D[np.isinf(D)] = D.max() + 10
@@ -827,6 +870,8 @@ class BasicSpikePCAClusterer(nn.Module):
         centroid_only=False,
         unit_ids_a=None,
         unit_ids_b=None,
+        return_reconstructions=False,
+        rank=None,
     ):
         if unit_ids_a is None:
             unit_ids_a = self.unit_ids()
@@ -839,6 +884,12 @@ class BasicSpikePCAClusterer(nn.Module):
             unit_ids_a, unit_ids_b
         )
         pairs = overlaps > self.min_overlap
+        if return_reconstructions:
+            reconstructions = torch.zeros(
+                (self.unit_ids().size, self.unit_ids().size, *self.mean.shape[1:]),
+                device=self.mean.device,
+                dtype=self.mean.dtype,
+            )
 
         if kind.endswith("likelihood"):
             mahals = np.full((unit_ids_a.size, unit_ids_b.size), np.inf)
@@ -894,9 +945,14 @@ class BasicSpikePCAClusterer(nn.Module):
                 wfs = centroids_b.reshape(
                     nb, self.data.tpca_rank, self.data.n_chans_cluster
                 )
-                loadings = self.embed_spikes(unit_a, wfs, rel_ix_b)
+                loadings = self.embed_spikes(unit_a, wfs, rel_ix_b, impute_iters=self.merge_impute_iters, rank=rank)
                 recons = self.reconstruct_spikes(unit_a, loadings, rel_ix_b)
+                if return_reconstructions:
+                    reconstructions[unit_a, units_b] = recons.reshape(len(units_b), -1)
                 err = wfs - recons
+                ignore = torch.from_numpy(scb == self.data.n_reg_chans).to(err.device)
+                ignore = ignore[:, None, :].broadcast_to(err.shape)
+                err[ignore] = 0.0
                 err = torch.square(err).sum(dim=(1, 2))
                 unexvar = err / torch.square(wfs).sum(dim=(1, 2))
                 errors[unit_a, units_b] = err.numpy(force=True)
@@ -906,7 +962,12 @@ class BasicSpikePCAClusterer(nn.Module):
                     nb, self.data.tpca_rank, self.data.n_chans_cluster
                 )
                 crels = self.centroid_to_spike_channels(unit_a, rel_ix_b)
+                if return_reconstructions:
+                    reconstructions[unit_a, units_b] = crels.reshape(len(units_b), -1)
                 err = wfs - crels
+                ignore = torch.from_numpy(scb == self.data.n_reg_chans).to(err.device)
+                ignore = ignore[:, None, :].broadcast_to(err.shape)
+                err[ignore] = 0.0
                 err = torch.square(err).sum(dim=(1, 2))
                 unexvar = err / torch.square(wfs).sum(dim=(1, 2))
                 errors[unit_a, units_b] = err.numpy(force=True)
@@ -923,6 +984,8 @@ class BasicSpikePCAClusterer(nn.Module):
         else:
             results["errors"] = errors
             results["unexplained_var"] = unexplained_var
+            if return_reconstructions:
+                results["reconstructions"] = reconstructions.numpy(force=True)
         return results
 
 
