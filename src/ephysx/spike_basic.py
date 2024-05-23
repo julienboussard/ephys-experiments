@@ -80,6 +80,10 @@ class BasicSpikePCAClusterer(nn.Module):
         train_units_batch_size=1,
         spike_batch_size=64,
         embedding_damping=0.0,
+        time_varying=False,
+        time_scale=100.0,
+        time_regularization=10.0,
+        time_rank=1,
         initially_clustered_only=False,
         centered=True,
         whiten_input=False,
@@ -117,6 +121,10 @@ class BasicSpikePCAClusterer(nn.Module):
         self.split_on_train = split_on_train
         self.merge_impute_iters = merge_impute_iters
         self.reassign_impute_iters = reassign_impute_iters
+        self.time_varying = time_varying
+        self.time_scale = time_scale
+        self.time_regularization = time_regularization
+        self.time_rank = time_rank
 
         self.labels, self.data = _load_data(
             sorting,
@@ -1032,6 +1040,96 @@ def get_channel_structures(cluster_channel_index):
 
 
 @torch.no_grad()
+def fit_time_varying(
+    X,
+    times,
+    missing,
+    empty,
+    rank,
+    time_rank,
+    max_iter=100,
+    check_every=5,
+    n_oversamples=10,
+    atol=1e-3,
+    show_progress=False,
+    centered=True,
+):
+    """
+    X : (nu, n, dim_in)
+    missing : (nu, n, dim_in)
+    empty : (nu, n)
+    """
+    # initialize mean
+    # Xc = torch.where(ignore, torch.nan, X)
+    Xc = X.clone()
+    if centered:
+        mean = torch.nan_to_num(Xc.nanmean(dim=-2, keepdims=True))
+    else:
+        shape = list(Xc.shape)
+        shape[-1] = 1
+        mean = torch.zeros(shape, device=Xc.device, dtype=Xc.dtype)
+
+    # after this line, isnan(Xc) === empty.
+    Xc[missing] = mean.broadcast_to(X.shape)[missing]
+    if centered:
+        mean = Xc.nanmean(dim=-2, keepdims=True)
+    else:
+        Xc = torch.where(empty[..., None], 0, Xc)
+    z = torch.ones((len(X), time_rank))
+
+    ###
+    filled = torch.logical_not(empty)
+    no_missing = not missing[filled].any()
+
+    # iterate svds
+    it = trange(max_iter, desc="SVD") if show_progress else range(max_iter)
+    # svd_storage = None
+    for j in it:
+        # update svd
+        if centered:
+            Xin = torch.where(empty[..., None], 0, Xc - mean)
+        else:
+            Xin = Xc
+        # svd_storage = torch.linalg.svd(Xin, full_matrices=False, out=svd_storage)
+        # U, S, Vh = svd_storage
+
+        # faster in my experience despite the note in torch.linalg.svd docs
+        U, S, V = torch.svd_lowrank(Xin, q=rank + n_oversamples)
+        Vh = V.mT
+
+        U = U[..., :rank]
+        S = S[..., :rank]
+        Vh = Vh[..., :rank, :]
+
+        if no_missing:
+            break
+
+        # impute
+        recon = torch.baddbmm(mean, U, S[..., None] * Vh)
+        check = not (j % check_every)
+        if check:
+            dx = (Xc[missing] - recon[missing]).abs().max().numpy(force=True)
+            dx = float(dx)
+            if show_progress:
+                it.set_description(f"{dx=:0.5f}")
+        Xc[missing] = recon[missing]
+        if centered:
+            mean = Xc.nanmean(dim=-2, keepdims=True)
+
+        if check and dx < atol:
+            break
+
+    # svd -> pca
+    loadings = U * S[..., None, :]
+    mean = mean[..., 0, :]
+    components = Vh.mT
+    svs = S
+
+    return loadings, mean, components, svs
+
+
+
+@torch.no_grad()
 def fit_pcas(
     X,
     missing,
@@ -1079,7 +1177,7 @@ def fit_pcas(
         else:
             Xin = Xc
         # svd_storage = torch.linalg.svd(Xin, full_matrices=False, out=svd_storage)
-        # U, S, Vh = svd_storage
+        # U, S, Vh = svd_storagev
 
         # faster in my experience despite the note in torch.linalg.svd docs
         U, S, V = torch.svd_lowrank(Xin, q=rank + n_oversamples)
