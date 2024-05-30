@@ -99,6 +99,7 @@ class GridGPFA(torch.nn.Module):
         points_per_lengthscale=2,
         grid_size=None,
         learn_lengthscale=False,
+        min_lengthscale=1e-5,
         learn_prior_noise_fraction=False,
         learn_obsstd=True,
         loss_on_interp=False,
@@ -136,7 +137,7 @@ class GridGPFA(torch.nn.Module):
 
         # kernel
         self.learn_lengthscale = learn_lengthscale
-        self.init_kernel(lengthscale)
+        self.init_kernel(lengthscale, min_lengthscale)
         # scale_tril = np.linalg.cholesky(K)
         self.register_buffer("prior_mean", torch.zeros(()))
         self.learn_prior_noise_fraction = learn_prior_noise_fraction
@@ -164,7 +165,8 @@ class GridGPFA(torch.nn.Module):
                 obs_logstd,
             )
 
-    def init_kernel(self, lengthscale):
+    def init_kernel(self, lengthscale, min_lengthscale):
+        assert lengthscale >= min_lengthscale
         if not self.learn_lengthscale:
             Kuu = RBF(lengthscale)(self.grid)
             grid_scale_left = np.linalg.cholesky(Kuu)
@@ -177,7 +179,10 @@ class GridGPFA(torch.nn.Module):
             )
 
         lengthscale = torch.tensor(lengthscale)
+        min_lengthscale = torch.tensor(min_lengthscale)
+        self.register_buffer("min_lengthscale", min_lengthscale)
         if self.learn_lengthscale:
+            lengthscale = lengthscale - self.min_lengthscale
             if lengthscale < 20.0:
                 # invert softplus
                 lengthscale = lengthscale.expm1().log()
@@ -187,7 +192,7 @@ class GridGPFA(torch.nn.Module):
 
     def lengthscale(self):
         if self.learn_lengthscale:
-            return F.softplus(self._lengthscale)
+            return F.softplus(self._lengthscale) + self.min_lengthscale
         return self._lengthscale
 
     def grid_cov(self):
