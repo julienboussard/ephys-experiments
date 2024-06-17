@@ -380,7 +380,14 @@ class InterpUnit(torch.nn.Module):
 
         return spike_ix, overlaps, badnesses
 
-    def divergence(self, other, kind="1-scaledr^2", aggregate=torch.amax, min_overlap=0.5, subset_channel_index=None):
+    def divergence(
+        self,
+        other,
+        kind="1-scaledr^2",
+        aggregate=torch.amax,
+        min_overlap=0.5,
+        subset_channel_index=None,
+    ):
         """Try to explain other units' mean (traces)"""
         other_channels = other.channels
         if subset_channel_index is not None:
@@ -506,7 +513,8 @@ class InterpClusterer(torch.nn.Module):
         residual_pca_kwargs=default_residual_pca_kwargs,
         split_kwargs=DPCSplitKwargs(),
         in_memory=True,
-        refit_triaged=True,
+        keep_spikes="byamp",
+        max_n_spikes=5000000,
         reassign_metric="1-scaledr^2",
         merge_metric="1-scaledr^2",
         merge_threshold=0.25,
@@ -518,6 +526,7 @@ class InterpClusterer(torch.nn.Module):
     ):
         self.min_cluster_size = min_cluster_size
         self.n_spikes_fit = n_spikes_fit
+        self.rg = np.random.default_rng(rg)
 
         self.data = _load_data(
             sorting,
@@ -526,7 +535,9 @@ class InterpClusterer(torch.nn.Module):
             wf_radius=waveform_radius,
             in_memory=in_memory,
             whiten_input=False,
-            initially_clustered_only=not refit_triaged,
+            keep=keep_spikes,
+            max_n_spikes=max_n_spikes,
+            rg=self.rg,
         )
         self.residual_pca_rank = residual_pca_rank
         self.unit_kw = dict(
@@ -540,7 +551,6 @@ class InterpClusterer(torch.nn.Module):
             residual_pca_kwargs=residual_pca_kwargs,
         )
 
-        self.rg = np.random.default_rng(rg)
         # torch.manual_seed(self.rg.bit_generator.random_raw())
         self.labels = torch.tensor(self.data.original_labels)
         self.models = torch.nn.ModuleDict()
@@ -713,7 +723,7 @@ class InterpClusterer(torch.nn.Module):
             kind = self.merge_metric
         subset_channel_index = None
         if self.merge_on_waveform_radius:
-            subset_channel_index = self.data.waveform_channel_index,
+            subset_channel_index = (self.data.waveform_channel_index,)
         units = self.unit_ids()
         nu = units.numel()
         divergences = torch.full((nu, nu), torch.nan)
@@ -735,9 +745,7 @@ class InterpClusterer(torch.nn.Module):
             kind=self.merge_metric,
             min_overlap=self.min_overlap,
         )
-        merge_dists = self.merge_sym_function(
-            merge_dists, merge_dists.T
-        )
+        merge_dists = self.merge_sym_function(merge_dists, merge_dists.T)
         merge_dists = merge_dists.numpy(force=True)
         merge_dists[np.isinf(merge_dists)] = merge_dists.max() + 10
         d = merge_dists[np.triu_indices(merge_dists.shape[0], k=1)]
@@ -761,7 +769,7 @@ class InterpClusterer(torch.nn.Module):
         for j, uid in enumerate(self.models.keys()):
             unit = self.models[uid]
             overlaps, rel_ix = unit.overlaps(self.data.spike_static_channels)
-            which, = torch.nonzero(overlaps >= self.min_overlap)
+            (which,) = torch.nonzero(overlaps >= self.min_overlap)
             if not which.numel():
                 continue
             overlaps = overlaps[which]
@@ -1365,15 +1373,34 @@ def _load_data(
     wf_radius=None,
     in_memory=False,
     whiten_input=False,
-    initially_clustered_only=False,
+    keep="all",
+    max_n_spikes=5000000,
+    rg=0,
 ):
+    rg = np.random.default_rng(rg)
+
     # load up labels
     labels = sorting.labels
-    if initially_clustered_only:
+    if keep == "labeled":
         keep_mask = labels >= 0
-    else:
+    elif keep == "all":
         keep_mask = np.ones(labels.shape, dtype=bool)
+    elif keep == "byamp":
+        keep_mask = labels >= 0
+        a = sorting.denoised_ptp_amplitudes
+        keep_mask = np.logical_or(
+            keep_mask,
+            a >= np.median(a[keep_mask]),
+        )
     keepers = np.flatnonzero(keep_mask)
+
+    if max_n_spikes and keepers.size > max_n_spikes:
+        print(f"Subsampling to {max_n_spikes} ({100*(max_n_spikes/labels.size):0.1f}%)")
+        keepers = rg.choice(keepers, size=max_n_spikes, replace=False)
+        keepers.sort()
+        keep_mask = np.zeros_like(keep_mask)
+        keep_mask[keepers] = 1
+
     labels = labels[keepers]
     channels = sorting.channels[keepers]
     times_seconds = sorting.times_seconds[keepers]
