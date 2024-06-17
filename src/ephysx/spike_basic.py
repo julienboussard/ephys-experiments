@@ -84,7 +84,7 @@ class BasicSpikePCAClusterer(nn.Module):
         time_scale=100.0,
         time_regularization=10.0,
         time_rank=1,
-        initially_clustered_only=False,
+        keep="all",
         centered=True,
         whiten_input=False,
         in_memory=True,
@@ -95,6 +95,7 @@ class BasicSpikePCAClusterer(nn.Module):
         merge_impute_iters=5,
         reassign_impute_iters=5,
         split_on_train=False,
+        max_n_spikes=5000000,
         rg=0,
     ):
         super().__init__()
@@ -130,10 +131,12 @@ class BasicSpikePCAClusterer(nn.Module):
             sorting,
             motion_est,
             fit_radius,
+            self.rg,
             wf_radius,
             in_memory,
             whiten_input,
-            initially_clustered_only,
+            keep,
+            max_n_spikes,
         )
         self.dim_input = self.data.tpca_rank * self.data.n_chans_cluster
 
@@ -246,7 +249,11 @@ class BasicSpikePCAClusterer(nn.Module):
             unit_ids = self.unit_ids()
         snrs = torch.zeros((unit_ids.size, self.data.n_reg_chans))
         for j, uid in enumerate(unit_ids):
-            avs = self.data.static_amp_vecs[self.labels == uid]
+            in_uid = np.flatnonzero(self.labels == uid)
+            if in_uid.size > self.n_wfs_fit:
+                in_uid = self.rg.choice(in_uid, size=self.n_wfs_fit, replace=False)
+                in_uid.sort()
+            avs = self.data.static_amp_vecs[in_uid]
             if no_count:
                 count = 1
             else:
@@ -1218,18 +1225,34 @@ def _load_data(
     sorting,
     motion_est,
     fit_radius,
+    rg,
     wf_radius=None,
     in_memory=False,
     whiten_input=False,
-    initially_clustered_only=False,
+    keep="all",
+    max_n_spikes=5000000,
 ):
     # load up labels
     labels = sorting.labels
-    if initially_clustered_only:
+    if keep == "labeled":
         keep_mask = labels >= 0
-    else:
+    elif keep == "all":
         keep_mask = np.ones(labels.shape, dtype=bool)
+    elif keep == "byamp":
+        keep_mask = labels >= 0
+        a = sorting.denoised_ptp_amplitudes
+        keep_mask = np.logical_or(
+            keep_mask,
+            a >= np.median(a[keep_mask]),
+        )
+    print(f"Keeping {keep_mask.sum()} ({100*keep_mask.mean():0.1f}%)")
     keepers = np.flatnonzero(keep_mask)
+    if max_n_spikes and keepers.size > max_n_spikes:
+        print(f"Subsampling to {max_n_spikes} ({100*(max_n_spikes/labels.size):0.1f}%)")
+        keepers = rg.choice(keepers, size=max_n_spikes, replace=False)
+        keepers.sort()
+        keep_mask = np.zeros_like(keep_mask)
+        keep_mask[keepers] = 1
     labels = labels[keepers]
     channels = sorting.channels[keepers]
 
