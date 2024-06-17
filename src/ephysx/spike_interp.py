@@ -168,8 +168,12 @@ class InterpUnit(torch.nn.Module):
         # unit channels logic
         self.needs_fit = True
 
-        self.register_buffer("inv_lambda", torch.tensor(1. / (amplitude_scaling_std ** 2)))
-        self.register_buffer("scale_clip_low", torch.tensor(1. / amplitude_scaling_limit))
+        self.register_buffer(
+            "inv_lambda", torch.tensor(1.0 / (amplitude_scaling_std**2))
+        )
+        self.register_buffer(
+            "scale_clip_low", torch.tensor(1.0 / amplitude_scaling_limit)
+        )
         self.register_buffer("scale_clip_high", amplitude_scaling_limit)
 
     def _needs_to_be_fitted(self):
@@ -187,6 +191,7 @@ class InterpUnit(torch.nn.Module):
             self.n_chans_full, self.n_chans_unit, device=cluster_channel_index.device
         )
         my_chans = cluster_channel_index[self.max_channel]
+        self.channels = my_chans.clone()
         my_valid = my_chans < self.n_chans_full
         my_ixs = torch.arange(self.n_chans_unit)[my_valid]
         channel_reindexer[my_chans[my_valid]] = my_ixs
@@ -229,10 +234,13 @@ class InterpUnit(torch.nn.Module):
         )
         return rel_ix
 
-    def get_means(self, times, padded=False, constant_value=torch.nan):
+    def get_means(self, times=None, padded=False, constant_value=torch.nan):
         self._needs_to_be_fitted()
-        n = len(times)
+        single = times is None
+        if not single:
+            n = len(times)
         if self.do_interp:
+            assert not single
             _, means_flat = self.interp(times)
             means = means_flat.view(n, self.waveform_rank, self.n_chans_unit)
             if padded:
@@ -242,7 +250,8 @@ class InterpUnit(torch.nn.Module):
             mean = mean_flat.view(self.waveform_rank, self.n_chans_unit)
             if padded:
                 mean = F.pad(mean, (0, 1), value=constant_value)
-            means = mean[None].broadcast_to(n, *mean.shape).contiguous()
+            if not single:
+                means = mean[None].broadcast_to(n, *mean.shape).contiguous()
 
         return means
 
@@ -348,6 +357,8 @@ class InterpUnit(torch.nn.Module):
 
         # try to reconstruct spikes
         recons_rel = self.get_means(times, padded=True)
+        if times is None:
+            recons_rel = recons_rel[None]
         recons = self.to_waveform_channels(recons_rel, rel_ix=rel_ix)
         recons = recons * mask
 
@@ -368,6 +379,65 @@ class InterpUnit(torch.nn.Module):
             badnesses["1-scaledr^2"] = scaled_l2 / wf_l2
 
         return spike_ix, overlaps, badnesses
+
+    def divergence(self, other, kind="1-scaledr^2", aggregate=torch.amax, min_overlap=0.5, subset_channel_index=None):
+        """Try to explain other units' mean (traces)"""
+        other_channels = other.channels
+        if subset_channel_index is not None:
+            other_channels = subset_channel_index[other.max_channel]
+
+        overlaps, rel_ix = self.overlaps(other_channels[None])
+        if overlaps.squeeze() < min_overlap:
+            return torch.inf
+
+        if not self.do_interp:
+            # simple static case
+            other_waveform = other.get_means()[None]
+            if subset_channel_index is not None:
+                other_waveform = other.to_waveform_channels(
+                    other_waveform,
+                    waveform_channels=other_channels,
+                )
+            _, _, badnesses = self.spike_badnesses(
+                times=None,
+                waveforms=other_waveform,
+                kinds=(kind,),
+                overlaps=overlaps,
+                rel_ix=rel_ix,
+            )
+            div = badnesses[kind].squeeze()
+            return div
+
+        # find grid times in common
+        common_grid = torch.logical_and(
+            self.interp.grid_fitted,
+            other.interp.grid_fitted,
+        )
+        if not common_grid.any():
+            return torch.inf
+        common_times = self.grid[common_grid]
+
+        # compare
+        other_waveforms = other.get_means(common_times)
+        if subset_channel_index is not None:
+            other_waveforms = other.to_waveform_channels(
+                other_waveforms,
+                waveform_channels=other_channels,
+            )
+        _, _, badnesses = self.spike_badnesses(
+            times=common_times,
+            waveforms=other_waveforms,
+            waveform_channels=other_channels[None],
+            kinds=(kind,),
+            overlaps=overlaps,
+            rel_ix=rel_ix,
+        )
+        div = badnesses[kind].squeeze()
+
+        # aggregate over time
+        div = aggregate(div)
+
+        return div
 
     def fit(
         self,
@@ -437,10 +507,13 @@ class InterpClusterer(torch.nn.Module):
         split_kwargs=DPCSplitKwargs(),
         in_memory=True,
         refit_triaged=True,
-        reassign_metric="1-r^2",
-        merge_metric="1-r^2",
+        reassign_metric="1-scaledr^2",
+        merge_metric="1-scaledr^2",
         merge_threshold=0.25,
+        merge_sym_function=torch.maximum,
         merge_linkage="complete",
+        merge_on_waveform_radius=True,
+        outlier_explained_var=0.0,
         rg=0,
     ):
         self.min_cluster_size = min_cluster_size
@@ -478,6 +551,13 @@ class InterpClusterer(torch.nn.Module):
         self.merge_metric = merge_metric
         self.merge_threshold = merge_threshold
         self.merge_linkage = merge_linkage
+        self.min_overlap = min_overlap
+        self.merge_sym_function = merge_sym_function
+        self.merge_on_waveform_radius = merge_on_waveform_radius
+        self.outlier_explained_var = outlier_explained_var
+
+        self.m_step()
+        self.order_by_depth()
 
     @property
     def device(self):
@@ -485,8 +565,7 @@ class InterpClusterer(torch.nn.Module):
 
     def update_labels(self, old_labels, new_labels=None, flat=False):
         """
-        Re-label units. Note, this should not split or merge labels, although e.g. cleanup
-        uses it to remove units.
+        Re-label units. This should not split labels, but merging is OK.
 
         Arguments
         ---------
@@ -501,9 +580,10 @@ class InterpClusterer(torch.nn.Module):
             new_labels = torch.arange(len(old_labels))
 
         if self.models:
-            new_models = {
-                newk: self.models[oldk] for oldk, newk in zip(old_labels, new_labels)
-            }
+            new_models = {}
+            for oldk, newk in zip(old_labels, new_labels):
+                if newk not in new_models:
+                    new_models[newk] = self.models[oldk]
             self.models.clear()
             self.models.update(new_models)
 
@@ -525,6 +605,9 @@ class InterpClusterer(torch.nn.Module):
         """Remove small units and make labels contiguous."""
         old_labels, counts = torch.unique(self.labels, return_counts=True)
         big_enough = counts >= self.min_cluster_size
+        n_removed = torch.logical_not(big_enough).sum()
+        if n_removed:
+            print(f"Removed {n_removed} too-small units.")
         self.update_labels(old_labels[big_enough], flat=False)
 
     def order_by_depth(self):
@@ -535,7 +618,7 @@ class InterpClusterer(torch.nn.Module):
         order = np.argsort([u.com for u in self.models])
         # this second argsort never fails to impress (my brain into a small cube)
         self.update_labels(
-            torch.arange(len(self.models)),
+            self.unit_ids(),
             torch.argsort(torch.from_numpy(order)),
             flat=True,
         )
@@ -584,7 +667,7 @@ class InterpClusterer(torch.nn.Module):
             unit.residual_embed(**data, out=features[sl])
 
         # -- back to CPU for DPC
-        features = features[:, :self.split_kw.rank].numpy(force=True)
+        features = features[:, : self.split_kw.rank].numpy(force=True)
         try:
             split_labels = density.density_peaks_clustering(
                 features,
@@ -625,19 +708,105 @@ class InterpClusterer(torch.nn.Module):
             self.labels[in_split] = new_label
         return split_units
 
-    def merge_distance_matrix(self):
-        pass
+    def central_divergences(self, kind=None, min_overlap=0.5):
+        if kind is None:
+            kind = self.merge_metric
+        subset_channel_index = None
+        if self.merge_on_waveform_radius:
+            subset_channel_index = self.data.waveform_channel_index,
+        units = self.unit_ids()
+        nu = units.numel()
+        divergences = torch.full((nu, nu), torch.nan)
+        for i, ua in enumerate(units):
+            for j, ub in enumerate(units):
+                if ua == ub:
+                    divergences[i, j] = 0
+                    continue
+                divergences[i, j] = self.models[ua].divergence(
+                    self.models[ub],
+                    kind=kind,
+                    min_overlap=min_overlap,
+                    subset_channel_index=subset_channel_index,
+                )
+        return divergences
 
-    def reassignment_distance_matrix(self):
-        pass
+    def merge(self):
+        merge_dists = self.central_divergences(
+            kind=self.merge_metric,
+            min_overlap=self.min_overlap,
+        )
+        merge_dists = self.merge_sym_function(
+            merge_dists, merge_dists.T
+        )
+        merge_dists = merge_dists.numpy(force=True)
+        merge_dists[np.isinf(merge_dists)] = merge_dists.max() + 10
+        d = merge_dists[np.triu_indices(merge_dists.shape[0], k=1)]
+        Z = linkage(d, method=self.merge_linkage)
+        new_labels = fcluster(Z, self.merge_threshold, criterion="distance")
+        unique_new_labels = np.unique(new_labels)
+        print(f"Merge: {merge_dists.shape[0]} -> {unique_new_labels.size}")
+
+        # update state
+        self.update_labels(self.unit_ids(), new_labels)
+        self.order_by_depth()
+
+    def reassignment_divergences(self):
+        unit_ids = self.unit_ids()
+        nu = unit_ids.size
+
+        dtype = self.data.tpca_embeds.dtype
+        shape = (nu, self.data.n_spikes)
+        divergences = dok_array(shape, dtype=dtype)
+
+        for j, uid in enumerate(self.models.keys()):
+            unit = self.models[uid]
+            overlaps, rel_ix = unit.overlaps(self.data.spike_static_channels)
+            which, = torch.nonzero(overlaps >= self.min_overlap)
+            if not which.numel():
+                continue
+            overlaps = overlaps[which]
+            rel_ix = rel_ix[which]
+
+            for sl, batch in self.batches(which):
+                res = unit.spike_badnesses(
+                    **batch,
+                    overlaps=overlaps[sl],
+                    rel_ix=rel_ix[sl],
+                    kinds=(self.reassign_metric,),
+                )
+                divergences[j, which[sl]] = res[self.reassign_metric]
+
+        return divergences
+
+    def reassign(self):
+        divergences = self.reassignment_divergences().tocsc()
+        # sparse nonzero rows. this is CSC format specific.
+        has_match = np.diff(divergences.indptr) > 0
+        match_threshold = 1.0 - self.outlier_explained_var
+
+        # we want sparse 0s to mean infinite err, and divs>thresh
+        # to be infinite as well. right now, [0, 1] with 0 as best
+        # subtract M to go to [-M, -M + 1].
+        errs = divergences.copy()
+        # errs.data[errs.data > match_threshold] += 212.0
+        errs.data[errs.data <= match_threshold] -= match_threshold - 212.0
+        new_labels = np.where(
+            has_match,
+            errs.argmin(0),
+            -1,
+        )
+        kept = np.flatnonzero(has_match)
+        new_labels[errs[new_labels[kept], kept] >= 0] = -1
+
+        self.labels = new_labels
+        self.cleanup()
 
     def unit_ids(self):
         ids = torch.unique(self.labels)
         ids = ids[ids >= 0]
         assert torch.equal(ids, torch.arange(ids.numel()))
         assert torch.equal(
-            ids,
-            torch.sort(torch.tensor([uid for uid in self.models.keys()]))
+            ids, torch.sort(torch.tensor([uid for uid in self.models.keys()]))
         )
         return ids
 
@@ -770,6 +939,8 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
         loss_on_interp=False,
         latent_update="gradient",
         do_prior=True,
+        fitted_point_count=25,
+        fitted_point_fraction="grid",
     ):
         super().__init__()
         self.t_bounds = t_bounds
@@ -800,6 +971,11 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
             self.register_buffer("grid_z", grid_z)
         else:
             assert False
+
+        self.fitted_point_count = fitted_point_count
+        self.fitted_point_fraction = fitted_point_fraction
+        if fitted_point_fraction == "grid":
+            self.fitted_point_fraction = 1 / self.grid_size
 
         self.do_prior = do_prior
         self.learn_lengthscale = learn_lengthscale
@@ -1055,6 +1231,26 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
                     left_interp_matrix=left_interp_matrix,
                     left_interp_pinv=left_interp_pinv,
                 )
+
+        # check which grid points had enough spikes
+        grid_neighbors = torch.cdist(
+            train_t[:, None],
+            self.grid[:, None],
+            p=1,
+        ).argmin(dim=1)
+        histogram = torch.zeros_like(self.grid)
+        histogram.scatter_add_(
+            0,
+            grid_neighbors,
+            torch.ones(1).broadcast_to(grid_neighbors.shape),
+        )
+        self.register_buffer(
+            "grid_fitted",
+            torch.logical_or(
+                histogram >= self.fitted_point_count,
+                histogram / histogram.sum() >= self.fitted_point_fraction,
+            ),
+        )
 
         return losses[: i + 1].numpy(force=True)
 
