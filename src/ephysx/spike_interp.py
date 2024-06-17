@@ -658,6 +658,16 @@ class InterpClusterer(torch.nn.Module):
         self.cleanup()
         self.order_by_depth()
 
+    def split_features(self, uid):
+        (in_unit,) = (self.labels == uid).nonzero(as_tuple=True)
+        n = in_unit.numel()
+        features = torch.empty((n, self.residual_pca_rank), device=self.device)
+        unit = self.models[uid]
+        for sl, data in self.batches(in_unit):
+            unit.residual_embed(**data, out=features[sl])
+        features = features[:, : self.split_kw.rank].numpy(force=True)
+        return in_unit, features
+
     def dpc_split_unit(self, uid):
         """
         Updates state by adding new models and updating labels etc after splitting a unit.
@@ -667,17 +677,8 @@ class InterpClusterer(torch.nn.Module):
         list of new IDs to split
         """
         # invariant: maintains contiguous label space of big-enough units
-
-        # -- featurize full set of spikes for this unit
-        (in_unit,) = (self.labels == uid).nonzero(as_tuple=True)
-        n = in_unit.numel()
         unit = self.models[uid]
-        features = torch.empty((n, self.residual_pca_rank), device=self.device)
-        for sl, data in self.batches(in_unit):
-            unit.residual_embed(**data, out=features[sl])
-
-        # -- back to CPU for DPC
-        features = features[:, : self.split_kw.rank].numpy(force=True)
+        in_unit, features = self.split_features(uid)
         try:
             split_labels = density.density_peaks_clustering(
                 features,
