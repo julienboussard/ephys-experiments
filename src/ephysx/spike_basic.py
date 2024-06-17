@@ -1,16 +1,16 @@
-from typing import Union
 import dataclasses
+from typing import Union
 
 from tqdm.auto import tqdm, trange
 
 import h5py
 import numpy as np
-from scipy.sparse import dok_array
 import torch
 import torch.nn.functional as F
 from dartsort.cluster import density
-from dartsort.util import drift_util, waveform_util, data_util
-from scipy.cluster.hierarchy import linkage, fcluster
+from dartsort.util import data_util, drift_util, waveform_util
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.sparse import dok_array
 from torch import nn
 
 tqdm_kw = dict(smoothing=0, mininterval=1 / 24)
@@ -315,7 +315,7 @@ class BasicSpikePCAClusterer(nn.Module):
         X = X[None].broadcast_to(n, *X.shape).contiguous()
         rel_ix_scatter = rel_ix[:, None, :].broadcast_to((n, r, rel_ix.shape[-1]))
         W = self.components[unit_id]
-        
+
         X.scatter_(src=waveforms, dim=2, index=rel_ix_scatter)
         Xflat = X[..., :-1].reshape(n, self.dim_input)
         embeds = (Xflat - m) @ W
@@ -361,7 +361,7 @@ class BasicSpikePCAClusterer(nn.Module):
         rel_ix = torch.tensor(rel_ix, device=self.mean.device)
         waveforms = self.data.getwf(spike_indices)
         waveforms = torch.tensor(waveforms, device=self.mean.device)
-        
+
         return overlaps, self.embed_spikes(
             unit_id, waveforms, rel_ix, damping=damping, impute_iters=impute_iters, rank=rank
         )
