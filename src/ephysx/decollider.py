@@ -1,10 +1,24 @@
+import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from scipy.interpolate import PchipInterpolator
 
 # TODO implement WaveformDenoiser versions
 
 
 class Decollider(nn.Module):
+
+    def __init__(self, smoothness_penalty=0, edge_penalty=0, edge_power=2, trough_offset_samples=42, spike_length_samples=121, dtype=torch.float):
+        super().__init__()
+        print(f"{smoothness_penalty=}")
+        self.smoothness_penalty = smoothness_penalty
+        self.edge_penalty = edge_penalty
+        if self.edge_penalty:
+            pchip = PchipInterpolator([0, trough_offset_samples - 10, trough_offset_samples, trough_offset_samples + 10, spike_length_samples - 1], [1, 0, 0, 0, 1])
+            weight = pchip(np.arange(spike_length_samples)) ** edge_power
+            assert np.all(weight == weight.clip(0, 1))
+            self.register_buffer("edge_weight", torch.tensor(weight, dtype=dtype))
 
     def predict(
         self, noisy_waveforms, noisier_waveforms=None, channel_masks=None, n2n_alpha=1.0
@@ -14,14 +28,19 @@ class Decollider(nn.Module):
         # forward(), but single-chan nets need a little logic
         return self.forward(noisy_waveforms, channel_masks=channel_masks)
 
-    model_predict = predict
+    def model_predict(
+        self, noisy_waveforms, noisier_waveforms=None, channel_masks=None, n2n_alpha=1.0
+    ):
+        # multi-chan prediction
+        # multi-chan nets below naturally implement this in their
+        # forward(), but single-chan nets need a little logic
+        return self.forward(noisier_waveforms, channel_masks=channel_masks)
 
     def loss(
         self, criterion, noisy_waveforms, noisier_waveforms=None, channel_masks=None
     ):
-        pred = self.predict(
-            noisy_waveforms=noisy_waveforms,
-            noisier_waveforms=noisier_waveforms,
+        pred = self.forward(
+            noisier_waveforms,
             channel_masks=channel_masks,
         )
 
@@ -33,6 +52,12 @@ class Decollider(nn.Module):
             )
         else:
             loss = criterion(pred, noisy_waveforms)
+
+        if self.smoothness_penalty:
+            loss += self.smoothness_penalty * torch.mean(torch.diff(pred, dim=-1))
+
+        if self.edge_penalty:
+            loss += self.edge_penalty * torch.mean(torch.square(pred) * self.edge_weight)
 
         return loss
 
@@ -61,12 +86,14 @@ class Noisier2NoiseMixin:
 
 
 class SingleChannelPredictor(Decollider):
-    def predict(self, waveforms, channel_masks=None):
+    def predict(self, noisy_waveforms, noisier_waveforms=None, channel_masks=None):
         """NCT -> NCT"""
-        n, c, t = waveforms.shape
-        waveforms = waveforms.reshape(n * c, 1, t)
-        preds = self.forward(waveforms)
+        n, c, t = noisy_waveforms.shape
+        noisy_waveforms = noisy_waveforms.reshape(n * c, 1, t)
+        preds = self.forward(noisy_waveforms)
         return preds.reshape(n, c, t)
+
+    model_predict = predict
 
 
 class SingleChannelDecollider(Noisier2NoiseMixin, SingleChannelPredictor):
@@ -83,8 +110,9 @@ class ConvToLinearSingleChannelDecollider(SingleChannelDecollider):
         hidden_linear_dims=(),
         spike_length_samples=121,
         final_activation="relu",
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         assert len(out_channels) == len(kernel_lengths)
         in_channels = (1, *out_channels[:-1])
         is_hidden = [True] * (len(out_channels) - 1) + [False]
@@ -130,8 +158,9 @@ class MLPSingleChannelDecollider(SingleChannelDecollider):
         hidden_sizes=(512, 256, 256),
         spike_length_samples=121,
         final_activation="relu",
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.net = nn.Sequential()
         self.net.append(nn.Flatten())
         input_sizes = (spike_length_samples, *hidden_sizes[:-1])
@@ -200,8 +229,9 @@ class ConvToLinearMultiChannelDecollider(MultiChannelDecollider):
         n_channels=1,
         spike_length_samples=121,
         final_activation="relu",
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         assert len(out_channels) == len(kernel_heights) == len(kernel_lengths)
         in_channels = (2, *out_channels[:-1])
         is_hidden = [True] * (len(out_channels) - 1) + [False]
@@ -251,8 +281,9 @@ class MLPMultiChannelDecollider(MultiChannelDecollider):
         n_channels=1,
         spike_length_samples=121,
         final_activation="relu",
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.net = nn.Sequential()
         self.net.append(nn.Flatten())
         input_sizes = (
@@ -283,10 +314,10 @@ class MLPMultiChannelDecollider(MultiChannelDecollider):
         )
 
 
-# -- idea which i am jokingly calling Noisier3Noise for now
+# -- idea which i am jokingly calling 2Noisier2Noise for now
 
 
-class Noisier3Noise(Decollider):
+class TwoNoisier2Noise(Decollider):
     def __init__(self, waveform_net, noise_net):
         super().__init__()
         self.waveform_net = waveform_net
@@ -305,19 +336,21 @@ class Noisier3Noise(Decollider):
     def model_predict(
         self, noisy_waveforms, noisier_waveforms=None, channel_masks=None, n2n_alpha=1.0
     ):
-        wf_pred = self.waveform_net.predict(
-            noisier_waveforms,
-            noisier_waveforms=noisier_waveforms,
-            channel_masks=channel_masks,
-            n2n_alpha=n2n_alpha,
-        )
-        noise_pred = self.noise_net.predict(
-            noisier_waveforms,
-            noisier_waveforms=noisier_waveforms,
-            channel_masks=channel_masks,
-            n2n_alpha=n2n_alpha,
-        )
-        return wf_pred - noise_pred
+        # wf_pred = self.waveform_net.model_predict(
+        #     None,
+        #     noisier_waveforms=noisier_waveforms,
+        #     channel_masks=channel_masks,
+        #     n2n_alpha=n2n_alpha,
+        # )
+        e_y_z = self.waveform_net.predict(noisier_waveforms, channel_masks=channel_masks)
+        # noise_pred = self.noise_net.model_predict(
+        #     None,
+        #     noisier_waveforms=noisier_waveforms,
+        #     channel_masks=channel_masks,
+        #     n2n_alpha=n2n_alpha,
+        # )
+        e_n_z = self.noise_net.predict(noisier_waveforms, channel_masks=channel_masks)
+        return e_y_z - e_n_z
 
     def loss(
         self, criterion, noisy_waveforms, noisier_waveforms=None, channel_masks=None

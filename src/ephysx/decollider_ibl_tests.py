@@ -3,10 +3,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from dartsort.util import decollider_util as dcu
+from . import decollider_util as dcu
 from dartsort.util import spikeio
 from dartsort.vis import geomplot
 from scipy.spatial import KDTree
+import h5py
+from pathlib import Path
 
 
 @torch.no_grad()
@@ -144,7 +146,7 @@ def test(
         )
     del naive_pred, naive_diff
 
-    # n2n prediction
+    # nodel prediction
     # pure noise waveforms, to assist in making noisier waveforms
     noise2 = []
     for _ in range(max(n2n_samples)):
@@ -173,46 +175,43 @@ def test(
     print(f"{len(noise2)=} {noise2[0].shape=}")
 
     for k in n2n_samples:
-        n2n_pred = np.nanmean(noise2[:k], axis=0)
-        n2n_diff = mask * (n2n_pred - gt_waveforms)
-        print(f"{n2n_pred.shape=} {n2n_diff.shape=}")
-        n2n_l2 = np.linalg.norm(n2n_diff, axis=(1, 2))
-        df[f"n2n_{k}sample{'s'*(k>1)}_l2err"] = n2n_l2
-        df[f"n2n_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(
+        model_pred = np.nanmean(noise2[:k], axis=0)
+        model_diff = mask * (model_pred - gt_waveforms)
+        print(f"{model_pred.shape=} {model_diff.shape=}")
+        model_l2 = np.linalg.norm(model_diff, axis=(1, 2))
+        df[f"model_{k}sample{'s'*(k>1)}_l2err"] = model_l2
+        df[f"model_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(model_diff).max(
             axis=(1, 2)
         )
         if return_waveforms:
-            waveforms[f"n2n_pred_{k}"] = n2n_pred
-        n2n_diff = n2n_pred - gt_waveforms
-        df[f"n2n_{k}sample{'s'*(k>1)}_l2err"] = np.linalg.norm(
-            n2n_diff, axis=(1, 2)
+            waveforms[f"model_pred_{k}"] = model_pred
+        model_diff = model_pred - gt_waveforms
+        df[f"model_{k}sample{'s'*(k>1)}_l2err"] = np.linalg.norm(
+            model_diff, axis=(1, 2)
         )
-        df[f"n2n_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(
+        df[f"model_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(model_diff).max(
             axis=(1, 2)
         )
-        
-        n2n_pred = np.nanmedian(noise2[:k], axis=0)
-        n2n_diff = mask * (n2n_pred - gt_waveforms)
-        print(f"{n2n_pred.shape=} {n2n_diff.shape=}")
-        n2n_l2 = np.linalg.norm(n2n_diff, axis=(1, 2))
-        df[f"n2nmed_{k}sample{'s'*(k>1)}_l2err"] = n2n_l2
-        df[f"n2nmed_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(
-            axis=(1, 2)
-        )
-        if return_waveforms:
-            waveforms[f"n2nmed_pred_{k}"] = n2n_pred
-        n2n_diff = n2n_pred - gt_waveforms
-        df[f"n2nmed_{k}sample{'s'*(k>1)}_l2err"] = np.linalg.norm(
-            n2n_diff, axis=(1, 2)
-        )
-        df[f"n2nmed_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(n2n_diff).max(
-            axis=(1, 2)
-        )
-        
-        
-        
-        del n2n_pred, n2n_diff
-        print(f"{n2n_l2.min()=} {n2n_l2.max()=}")
+
+        # model_pred = np.nanmedian(noise2[:k], axis=0)
+        # model_diff = mask * (model_pred - gt_waveforms)
+        # print(f"{model_pred.shape=} {model_diff.shape=}")
+        # model_l2 = np.linalg.norm(model_diff, axis=(1, 2))
+        # df[f"modelmed_{k}sample{'s'*(k>1)}_l2err"] = model_l2
+        # df[f"modelmed_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(model_diff).max(
+        #     axis=(1, 2)
+        # )
+        # if return_waveforms:
+        #     waveforms[f"modelmed_pred_{k}"] = model_pred
+        # model_diff = model_pred - gt_waveforms
+        # df[f"modelmed_{k}sample{'s'*(k>1)}_l2err"] = np.linalg.norm(
+        #     model_diff, axis=(1, 2)
+        # )
+        # df[f"modelmed_{k}sample{'s'*(k>1)}_maxerr"] = np.abs(model_diff).max(
+        #     axis=(1, 2)
+        # )
+        # del model_pred, model_diff
+        print(f"{model_l2.min()=} {model_l2.max()=}")
 
     if return_waveforms:
         return df, waveforms
@@ -275,11 +274,11 @@ def comparison_vis(
             linestyles[name] = "-"
             j += 1
 
-    # check largest n2n k
-    n2nk = max(
+    # check largest model k
+    modelk = max(
         int(k.split("_")[-1])
         for k in names2wfdicts[names[0]].keys()
-        if k.startswith("n2n") and filt(k)
+        if k.startswith("model") and filt(k)
     )
 
     npreds = len(names2wfdicts[names[0]]) - 2
@@ -297,7 +296,7 @@ def comparison_vis(
     )
     for f in (fig, top, bottom):
         f.patch.set_visible(False)
-    naive_l2_ax, naive_max_ax, n2n_l2_ax, n2n_max_ax = top.subplots(
+    naive_l2_ax, naive_max_ax, model_l2_ax, model_max_ax = top.subplots(
         ncols=4, sharey=True
     )
     axs = bottom.subplots(
@@ -345,17 +344,17 @@ def comparison_vis(
     handles = []
     for j, (name, wf_dict) in enumerate(names2wfdicts.items()):
         naive_pred = wf_dict["naive_pred"][spike_index].T
-        n2nkeys = [k for k in wf_dict.keys() if k.startswith("n2n") and filt(k)]
-        assert n2nkeys[-1].endswith(f"_{n2nk}")
+        modelkeys = [k for k in wf_dict.keys() if k.startswith("model") and filt(k)]
+        assert modelkeys[-1].endswith(f"_{modelk}")
 
         row_axs = axs[j]
         row_axs[0].set_ylabel(name)
         if not j:
             row_axs[0].set_title("naive", fontsize=8)
             row_axs[1].set_title("< gt resid", fontsize=8)
-            for n, k in enumerate(n2nkeys):
+            for n, k in enumerate(modelkeys):
                 thek = int(k.split("_")[-1])
-                row_axs[2 + 2 * n].set_title(f"n2n-{thek}", fontsize=8)
+                row_axs[2 + 2 * n].set_title(f"model-{thek}", fontsize=8)
                 row_axs[3 + 2 * n].set_title(f"< gt resid", fontsize=8)
 
         color = colors[name]
@@ -366,25 +365,25 @@ def comparison_vis(
         geomplot(naive_pred, ax=row_axs[0], **gpkw)
         geomplot(naive_diff, ax=row_axs[1], **gpkw)
 
-        for n, k in enumerate(n2nkeys):
-            n2n_pred = wf_dict[k][spike_index].T
-            n2n_diff = gtwf - n2n_pred
-            geomplot(n2n_pred, ax=row_axs[2 + 2 * n], **gpkw)
-            geomplot(n2n_diff, ax=row_axs[3 + 2 * n], **gpkw)
+        for n, k in enumerate(modelkeys):
+            model_pred = wf_dict[k][spike_index].T
+            model_diff = gtwf - model_pred
+            geomplot(model_pred, ax=row_axs[2 + 2 * n], **gpkw)
+            geomplot(model_diff, ax=row_axs[3 + 2 * n], **gpkw)
 
         gt_ptp = gtwf.ptp(0)
         naive_l2 = np.linalg.norm(naive_diff, axis=0)
         naive_max = np.abs(naive_diff).max(0)
-        n2n_l2 = np.linalg.norm(n2n_diff, axis=0)
-        n2n_max = np.abs(n2n_diff).max(0)
+        model_l2 = np.linalg.norm(model_diff, axis=0)
+        model_max = np.abs(model_diff).max(0)
         naive_l2_ax.scatter(gt_ptp, naive_l2, color=color, **scatter_kw)
         naive_max_ax.scatter(gt_ptp, naive_max, color=color, **scatter_kw)
-        n2n_l2_ax.scatter(gt_ptp, n2n_l2, color=color, **scatter_kw)
-        n2n_max_ax.scatter(gt_ptp, n2n_max, color=color, **scatter_kw)
+        model_l2_ax.scatter(gt_ptp, model_l2, color=color, **scatter_kw)
+        model_max_ax.scatter(gt_ptp, model_max, color=color, **scatter_kw)
         l = knn_ciline(naive_l2_ax, gt_ptp, naive_l2, color=color, ls=ls, doci=False)
         knn_ciline(naive_max_ax, gt_ptp, naive_max, color=color, ls=ls, doci=False)
-        knn_ciline(n2n_l2_ax, gt_ptp, n2n_l2, color=color, ls=ls, doci=False)
-        knn_ciline(n2n_max_ax, gt_ptp, n2n_max, color=color, ls=ls, doci=False)
+        knn_ciline(model_l2_ax, gt_ptp, model_l2, color=color, ls=ls, doci=False)
+        knn_ciline(model_max_ax, gt_ptp, model_max, color=color, ls=ls, doci=False)
         
         names.append(name)
         handles.append(l[0])
@@ -401,9 +400,112 @@ def comparison_vis(
 
     naive_l2_ax.set_title("naive l2 err")
     naive_max_ax.set_title("naive max err")
-    n2n_l2_ax.set_title(f"n2n {n2nk} samps l2 err")
-    n2n_max_ax.set_title(f"n2n {n2nk} max err")
-    for ax in (naive_l2_ax, naive_max_ax, n2n_l2_ax, n2n_max_ax):
+    model_l2_ax.set_title(f"model {modelk} samps l2 err")
+    model_max_ax.set_title(f"model {modelk} max err")
+    for ax in (naive_l2_ax, naive_max_ax, model_l2_ax, model_max_ax):
         ax.set_xlabel("per-channel gt ptp")
 
     return fig
+
+
+def train_and_save(
+    model_name,
+    net_factory,
+    save_folder,
+    recording,
+    det_h5,
+    train_seconds,
+    val_seconds,
+    channel_index,
+    spike_sample_p=None,
+    singlechan=True,
+    channel_jitter_index=None,
+    n2_alpha=1.0,
+    detection_threshold=5,
+    noise_same_chans=False,
+    early_stop_cur_epochs=20,
+    final_activation="relu",
+    opt="adam",
+    weight_decay=0,
+    device_index=0,
+    irandom=0,
+    val_every=1,
+    seed=0,
+):
+    save_folder.mkdir(exist_ok=True)
+    if (save_folder / "val_df.csv").exists():
+        return
+
+    device = torch.device(f"cuda:{device_index}")
+    print(model_name)
+    net = net_factory(final_activation=final_activation)
+    net.to(device)
+    print(net)
+
+    with h5py.File(det_h5, "r") as h5:
+        times = h5["times_samples"][()]
+        channels = h5["channels"][()]
+
+    train_mask = np.isin(
+        np.floor(recording.sample_index_to_time(times)), train_seconds
+    )
+    val_mask = np.isin(
+        np.floor(recording.sample_index_to_time(times)), val_seconds
+    )
+    print(f"{train_mask.sum()=} {val_mask.sum()=}")
+    times_train = times[train_mask]
+    channels_train = channels[train_mask]
+    times_val = times[val_mask]
+    channels_val = channels[val_mask]
+    if spike_sample_p is not None:
+        sample_p_train = [spike_sample_p[train_mask]]
+        sample_p_val = [spike_sample_p[val_mask]]
+
+    net, train_df, val_df = dcu.train_decollider(
+        net,
+        recordings=[recording],
+        detection_times_train=[times_train],
+        detection_channels_train=[channels_train],
+        detection_p_train=sample_p_train,
+        detection_times_val=[times_val],
+        detection_channels_val=[channels_val],
+        detection_p_val=sample_p_val,
+        channel_index=None if singlechan else channel_index,
+        channel_jitter_index=channel_index
+        if singlechan
+        else channel_jitter_index,
+        noise_same_chans=noise_same_chans,
+        early_stop_cur_epochs=early_stop_cur_epochs,
+        noise2_alpha=n2_alpha,
+        data_random_seed=seed,
+        device=device,
+        show_progress=True,
+        opt_class=torch.optim.Adam if opt == "adam" else torch.optim.SGD,
+        opt_kw=dict(weight_decay=weight_decay),
+        val_every=val_every,
+    )
+    net.cpu()
+    import gc; gc.collect(); torch.cuda.empty_cache()
+
+    val_df["training_time_noval"] = np.cumsum(
+        val_df.epoch_train_wall_dt_s + val_df.epoch_data_load_wall_dt_s
+    )
+    val_df["total_time"] = np.cumsum(
+        val_df.epoch_train_wall_dt_s + val_df.epoch_data_load_wall_dt_s
+        + val_df.val_metrics_wall_dt_s + val_df.val_data_load_wall_dt_s
+    )
+    val_df["model"] = model_name
+    val_df["weight_decay"] = weight_decay
+    val_df["opt"] = opt
+    val_df["noise2_alpha"] = str(n2_alpha)
+    val_df["early_stop"] = True
+    val_df["final_activation"] = final_activation
+    val_df["detection_threshold"] = str(detection_threshold)
+    val_df["noise_same_chans"] = str(int(noise_same_chans))
+    val_df["irandom"] = str(irandom)
+
+    save_folder = Path(save_folder)
+    save_folder.mkdir(exist_ok=True, parents=True)
+    torch.save(net, save_folder / "net.pt")
+    train_df.to_csv(save_folder / "train_df.csv")
+    val_df.to_csv(save_folder / "val_df.csv")

@@ -3,19 +3,12 @@ from typing import Optional, Union
 
 from tqdm.auto import tqdm, trange
 
-import gpytorch
 import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
 from dartsort.cluster import density
 from dartsort.util import data_util, drift_util, waveform_util
-from gpytorch.distributions import Delta, MultivariateNormal
-from gpytorch.kernels import InducingPointKernel, RBFKernel, ScaleKernel
-from gpytorch.means import ZeroMean
-# from gpytorch.utils.interpolation import Interpolation
-from linear_operator.operators import DiagLinearOperator
-from linear_operator.utils.interpolation import left_interp
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.linalg import eigh
 from scipy.sparse import dok_array
@@ -57,6 +50,7 @@ class SpikeData(torch.nn.Module):
         self.n_chans_unit = n_chans_unit
         self.n_chans_waveform = n_chans_waveform
         self.n_spikes = n_spikes
+        self.in_memory = in_memory
 
         # arrays not needed in torch
         self.original_labels = original_labels
@@ -65,11 +59,11 @@ class SpikeData(torch.nn.Module):
 
         # CPU tensors
         self.keepers = torch.from_numpy(keepers)
-        self.static_amp_vecs = torch.tensor(static_amp_vecs)
-        if pin:
+        self.static_amp_vecs = torch.as_tensor(static_amp_vecs)
+        if pin and torch.cuda.is_available():
             self.static_amp_vecs = self.static_amp_vecs.pin_memory()
         self.tpca_embeds = tpca_embeds
-        if pin and self.in_memory:
+        if pin and self.in_memory and torch.cuda.is_available():
             self.tpca_embeds = self.tpca_embeds.pin_memory()
 
         # GPU
@@ -77,12 +71,13 @@ class SpikeData(torch.nn.Module):
         self.register_buffer(
             "cluster_channel_index", torch.tensor(cluster_channel_index)
         )
-        self.register_buffer("times_seconds", torch.tensor(times_seconds))
+        self.register_buffer("times_seconds", torch.tensor(times_seconds, dtype=torch.float))
         self.register_buffer("channels", torch.tensor(channels))
+        self.register_buffer("spike_static_channels", torch.tensor(spike_static_channels))
 
-    def get_waveforms(self, index):
+    def get_waveforms(self, index, device=None):
         if self.in_memory:
-            waveforms = self.tpca_embeds[index]
+            waveforms = torch.from_numpy(self.tpca_embeds[index])
         else:
             scalar = np.isscalar(index)
             index = np.atleast_1d(index)
@@ -98,18 +93,20 @@ class SpikeData(torch.nn.Module):
             )
             if scalar:
                 waveforms = waveforms[0]
+            waveforms = torch.from_numpy(waveforms)
+        if device is not None:
+            waveforms = waveforms.to(device)
         return waveforms
 
 
 default_fa_kwargs = dict(
-    latent_update="embed_uninterp",
+    latent_update="gradient",
     do_prior=False,
 )
 
 default_fa_fit_kwargs = dict(
     lr=0.05,
     eps=1e-6,
-    show_progress=True,
     n_iter=100,
     loss_converged=1e-2,
 )
@@ -174,13 +171,13 @@ class InterpUnit(torch.nn.Module):
         self.register_buffer(
             "scale_clip_low", torch.tensor(1.0 / amplitude_scaling_limit)
         )
-        self.register_buffer("scale_clip_high", amplitude_scaling_limit)
+        self.register_buffer("scale_clip_high", torch.tensor(amplitude_scaling_limit))
 
     def _needs_to_be_fitted(self):
         assert not self.needs_fit
 
     def determine_position_(self, static_amp_vecs, geom, cluster_channel_index):
-        assert cluster_channel_index.shape == (self.n_chans_full, self.n_chans_uni)
+        assert cluster_channel_index.shape == (self.n_chans_full, self.n_chans_unit)
 
         count = torch.sqrt(torch.isfinite(static_amp_vecs).sum(0))
         snr = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0)) * count
@@ -188,7 +185,7 @@ class InterpUnit(torch.nn.Module):
         self.max_channel = snr.argmax()
 
         channel_reindexer = torch.full(
-            self.n_chans_full, self.n_chans_unit, device=cluster_channel_index.device
+            (self.n_chans_full + 1,), self.n_chans_unit, device=cluster_channel_index.device
         )
         my_chans = cluster_channel_index[self.max_channel]
         self.channels = my_chans.clone()
@@ -228,7 +225,7 @@ class InterpUnit(torch.nn.Module):
         rel_ix : (n_spikes, n_chans_unit)
         """
         rel_ix = torch.take_along_dim(
-            self.unit_reindexers[None],
+            self.channel_reindexer[None],
             static_channels,
             axis=1,
         )
@@ -287,7 +284,7 @@ class InterpUnit(torch.nn.Module):
         n, r, c = waveforms.shape
         rel_ix_scatter = rel_ix[:, None, :].broadcast_to((n, r, rel_ix.shape[-1]))
         waveforms_rel.scatter_(src=waveforms, dim=2, index=rel_ix_scatter)
-        return waveforms_rel
+        return waveforms_rel[..., :self.n_chans_unit]
 
     def to_waveform_channels(self, waveforms_rel, waveform_channels=None, rel_ix=None):
         if rel_ix is None:
@@ -454,6 +451,7 @@ class InterpUnit(torch.nn.Module):
         static_amp_vecs,
         geom,
         cluster_channel_index,
+        show_progress=False,
     ):
         # transfer waveform -> unit channels, filling with nans
         self.determine_position_(static_amp_vecs, geom, cluster_channel_index)
@@ -474,12 +472,13 @@ class InterpUnit(torch.nn.Module):
             self.interp.fit(
                 times,
                 waveforms_flat,
+                show_progress=show_progress,
                 **self.fa_fit_kwargs,
             )
             _, means_flat = self.interp(times)
             residuals_flat = waveforms_flat - means_flat
 
-        self.pca.fit(residuals_flat)
+        self.pca.fit(residuals_flat, show_progress=show_progress)
         self.needs_fit = False
 
 
@@ -524,6 +523,7 @@ class InterpClusterer(torch.nn.Module):
         outlier_explained_var=0.0,
         rg=0,
     ):
+        super().__init__()
         self.min_cluster_size = min_cluster_size
         self.n_spikes_fit = n_spikes_fit
         self.rg = np.random.default_rng(rg)
@@ -549,6 +549,7 @@ class InterpClusterer(torch.nn.Module):
             do_interp=do_interp,
             fa_kwargs=fa_kwargs,
             residual_pca_kwargs=residual_pca_kwargs,
+            n_chans_full=self.data.n_chans_full,
         )
 
         # torch.manual_seed(self.rg.bit_generator.random_raw())
@@ -566,8 +567,14 @@ class InterpClusterer(torch.nn.Module):
         self.merge_on_waveform_radius = merge_on_waveform_radius
         self.outlier_explained_var = outlier_explained_var
 
-        self.m_step()
-        self.order_by_depth()
+        # self.m_step()
+        # self.order_by_depth()
+
+    def __getitem__(self, ix):
+        return self.models[str(ix)]
+
+    def __contains__(self, ix):
+        return str(ix) in self.models
 
     @property
     def device(self):
@@ -591,9 +598,12 @@ class InterpClusterer(torch.nn.Module):
 
         if self.models:
             new_models = {}
-            for oldk, newk in zip(old_labels, new_labels):
+            order = torch.argsort(new_labels)
+            for j in order:
+                oldk = old_labels[j]
+                newk = new_labels[j]
                 if newk not in new_models:
-                    new_models[newk] = self.models[oldk]
+                    new_models[str(newk)] = self[oldk]
             self.models.clear()
             self.models.update(new_models)
 
@@ -635,17 +645,17 @@ class InterpClusterer(torch.nn.Module):
 
     def m_step(self, force=False):
         """Fit all models that need fitting."""
-        for uid in self.unit_ids():
-            if uid > len(self.models):
+        for uid in tqdm(self.unit_ids(), desc="M step"):
+            if uid not in self:
                 unit = InterpUnit(**self.unit_kw)
                 unit.to(self.device)
-                self.models.append(unit)
-            model = self.models[uid]
+                self.models[str(uid)] = unit
+            model = self[uid]
 
             if not (force or model.needs_fit):
                 continue
 
-            model.fit(**self.get_training_data(uid))
+            model.fit(**self.get_training_data(uid), show_progress=False)
 
     def residual_dpc_split(self):
         unit_ids_to_split = list(self.unit_ids())
@@ -662,7 +672,7 @@ class InterpClusterer(torch.nn.Module):
         (in_unit,) = (self.labels == uid).nonzero(as_tuple=True)
         n = in_unit.numel()
         features = torch.empty((n, self.residual_pca_rank), device=self.device)
-        unit = self.models[uid]
+        unit = self[uid]
         for sl, data in self.batches(in_unit):
             unit.residual_embed(**data, out=features[sl])
         features = features[:, : self.split_kw.rank].numpy(force=True)
@@ -677,7 +687,7 @@ class InterpClusterer(torch.nn.Module):
         list of new IDs to split
         """
         # invariant: maintains contiguous label space of big-enough units
-        unit = self.models[uid]
+        unit = self[uid]
         in_unit, features = self.split_features(uid)
         try:
             split_labels = density.density_peaks_clustering(
@@ -733,8 +743,8 @@ class InterpClusterer(torch.nn.Module):
                 if ua == ub:
                     divergences[i, j] = 0
                     continue
-                divergences[i, j] = self.models[ua].divergence(
-                    self.models[ub],
+                divergences[i, j] = self[ua].divergence(
+                    self[ub],
                     kind=kind,
                     min_overlap=min_overlap,
                     subset_channel_index=subset_channel_index,
@@ -814,9 +824,10 @@ class InterpClusterer(torch.nn.Module):
         ids = torch.unique(self.labels)
         ids = ids[ids >= 0]
         assert torch.equal(ids, torch.arange(ids.numel()))
-        assert torch.equal(
-            ids, torch.sort(torch.tensor([uid for uid in self.models.keys()]))
-        )
+        # if self.models:
+        #     assert torch.equal(
+        #         ids, torch.tensor([int(uid.numpy(force=True)) for uid in self.models.keys()])
+        #     )
         return ids
 
     def get_training_data(self, uid):
@@ -857,7 +868,6 @@ class MaskedPCA(torch.nn.Module):
         check_every=5,
         n_oversamples=10,
         atol=1e-3,
-        show_progress=False,
         centered=True,
         transform_iter=0,
     ):
@@ -867,7 +877,6 @@ class MaskedPCA(torch.nn.Module):
             check_every=check_every,
             n_oversamples=n_oversamples,
             atol=atol,
-            show_progress=show_progress,
             centered=centered,
         )
         self.rank = rank
@@ -879,18 +888,21 @@ class MaskedPCA(torch.nn.Module):
         self.register_buffer("weight", torch.empty((rank, input_dim)))
         self.register_buffer("svs", torch.empty((rank)))
 
-    def fit(self, waveforms):
+    def fit(self, waveforms, show_progress=False):
         missing = torch.isnan(waveforms)
         empty = missing.all(1)
         loadings, mean, components, svs = fit_pcas(
             waveforms,
             missing,
             empty,
+            rank=self.rank,
+            show_progress=show_progress,
             **self.fit_kw,
         )
-        self.train_loadings = loadings
-        self.weight.copy_(components)
-        self.mean.copy_(mean)
+        # self.train_loadings = loadings
+        self.weight.copy_(components.T)
+        if self.centered:
+            self.mean.copy_(mean)
         self.svs.copy_(svs)
 
     def forward_precentered(self, waveforms, out=None):
@@ -1027,7 +1039,7 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
         assert lengthscale >= min_lengthscale
         if not self.learn_lengthscale:
             Kuu = RBF(lengthscale)(self.grid)
-            self._grid_cov = Kuu
+            self.register_buffer("_grid_cov", torch.tensor(Kuu, dtype=torch.float))
             if self.do_prior:
                 grid_scale_left = np.linalg.cholesky(Kuu)
                 self.register_buffer(
@@ -1122,7 +1134,7 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
 
     @torch.no_grad()
     def update_z_embed_uninterp(
-        self, y, prior_dist=None, left_interp_matrix=None, left_interp_pinv=None
+        self, y, prior_dist=None, left_interp_matrix=None, left_interp_pinv=None, mask=None
     ):
         assert self.training
 
@@ -1130,7 +1142,7 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
             prior_dist = self.get_prior_distribution(left_interp_matrix)
         if left_interp_pinv is None:
             left_interp_pinv = torch.linalg.pinv(left_interp_matrix)
-        z = self.embed(y)
+        z = self.embed(y, mask=mask)
         z = left_interp_pinv @ z
         if self.do_prior:
             assert False
@@ -1140,21 +1152,33 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
             # z = left_interp_pinv @ z
         self.grid_z.copy_(z)
 
-    def embed(self, y):
+    def embed(self, y, mask=None):
         if self.training:
-            unweight = torch.linalg.pinv(self.net.weight).T
+            try:
+                unweight = torch.linalg.pinv(self.net.weight).T
+            except Exception as e:
+                print("bad")
+                print(f"{torch.isfinite(self.net.bias).all()=}")
+                print(f"{torch.isfinite(self.net.weight).all()=}")
+                print(f"{torch.isfinite(torch.where(mask, y, self.net.bias[None])).all()=}")
+                print(f"{y.shape=}")
+                raise
         else:
             if self._unweight is None:
                 self._unweight = torch.linalg.pinv(self.net.weight).T
             unweight = self._unweight
+        if mask is not None:
+            y = torch.where(mask, y, self.net.bias[None])
+        print(f"{torch.isfinite(self.net.bias).all()=}")
+        print(f"{torch.isfinite(self.net.weight).all()=}")
+        print(f"{torch.isfinite(y).all()=}")
+        print(f"{y.shape=}")
         return (y - self.net.bias) @ unweight
 
     def log_likelihood(self, preds, targets, mask_tuple):
         obs_var = (2 * self.obs_logstd).exp()
-        # recon_err = torch.nansum(torch.square(preds - targets))
         recon_err = torch.square(preds[mask_tuple] - targets[mask_tuple])
         recon_err = (recon_err / obs_var[mask_tuple[1]]).sum()
-        # denom = (mask * self.obs_logstd).sum()
         denom = (self.obs_logstd[mask_tuple[1]]).sum()
         loglik = -0.5 * recon_err - denom
 
@@ -1184,11 +1208,15 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
         weights = left_interp_matrix @ self.grid_cov()
         weights = weights / weights.sum(0)
         zinit = weights.T @ loadings
+        print(f"{torch.isfinite(mean).all()=}")
+        print(f"{torch.isfinite(components).all()=}")
 
         with torch.no_grad():
             self.net.bias.copy_(mean)
             self.net.weight.copy_(components)
             self.grid_z.copy_(zinit)
+        print(f"{torch.isfinite(self.net.bias).all()=}")
+        print(f"{torch.isfinite(self.net.weight).all()=}")
 
     def fit(
         self,
@@ -1209,11 +1237,12 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
 
         # missing values info
         mask = torch.isfinite(train_y)
-        mask_tuple = torch.nonzero(mask)
+        mask_tuple = torch.nonzero(mask, as_tuple=True)
         missing = torch.logical_not(mask)
         empty = missing.all(1)
 
         # initialize with pca
+        print("init")
         self.initialize_svd_smoothed(
             train_t, train_y, left_interp_matrix, missing, empty
         )
@@ -1239,19 +1268,20 @@ class CubicInterpFactorAnalysis(torch.nn.Module):
                     prior_dist=prior_dist,
                     left_interp_matrix=left_interp_matrix,
                     left_interp_pinv=left_interp_pinv,
+                    mask=mask,
                 )
 
         # check which grid points had enough spikes
         grid_neighbors = torch.cdist(
             train_t[:, None],
-            self.grid[:, None],
+            self.grid,
             p=1,
         ).argmin(dim=1)
-        histogram = torch.zeros_like(self.grid)
+        histogram = torch.zeros(self.grid_size, device=grid_neighbors.device, dtype=grid_neighbors.dtype)
         histogram.scatter_add_(
             0,
             grid_neighbors,
-            torch.ones(1).broadcast_to(grid_neighbors.shape),
+            torch.ones(1, dtype=grid_neighbors.dtype).broadcast_to(grid_neighbors.shape),
         )
         self.register_buffer(
             "grid_fitted",
@@ -1312,6 +1342,7 @@ def fit_pcas(
     ###
     filled = torch.logical_not(empty)
     no_missing = not missing[filled].any()
+    addmm = torch.baddbmm if X.ndim == 3 else torch.addmm
 
     # iterate svds
     it = trange(max_iter, desc="SVD") if show_progress else range(max_iter)
@@ -1338,7 +1369,7 @@ def fit_pcas(
             break
 
         # impute
-        recon = torch.baddbmm(mean, U, S[..., None] * Vh)
+        recon = addmm(mean, U, S[..., None] * Vh)
         check = not (j % check_every)
         if check:
             dx = (Xc[missing] - recon[missing]).abs().max().numpy(force=True)

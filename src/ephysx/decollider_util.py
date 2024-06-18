@@ -24,12 +24,15 @@ def train_decollider(
     templates_train=None,
     templates_val=None,
     detection_times_train=None,
+    detection_p_train=None,
     detection_channels_train=None,
     detection_times_val=None,
     detection_channels_val=None,
+    detection_p_val=None,
     channel_index=None,
     channel_min_amplitude=0.0,
     channel_jitter_index=None,
+    collisions_prop=0.0,
     examples_per_epoch=10_000,
     noise_same_chans=False,
     noise2_alpha=1.0,
@@ -40,7 +43,8 @@ def train_decollider(
     validation_oversamples=3,
     n_unsupervised_val_examples=2000,
     max_n_epochs=500,
-    early_stop_decrease_epochs=5,
+    early_stop_cur_epochs=20,
+    early_stop_prev_epochs=50,
     batch_size=64,
     loss_class=torch.nn.MSELoss,
     opt_class=torch.optim.Adam,
@@ -125,11 +129,13 @@ def train_decollider(
             templates=templates_train,
             detection_times=detection_times_train,
             detection_channels=detection_channels_train,
+            detection_p=detection_p_train,
             channel_index=channel_index,
             template_recording_origin=templates_train_recording_origin,
             recording_channel_indices=recording_channel_indices,
             channel_min_amplitude=channel_min_amplitude,
             channel_jitter_index=channel_jitter_index,
+            collisions_prop=collisions_prop,
             examples_per_epoch=examples_per_epoch,
             noise_same_chans=noise_same_chans,
             noise2_alpha=noise2_alpha,
@@ -192,7 +198,9 @@ def train_decollider(
             templates=templates_val,
             detection_times=detection_times_val,
             detection_channels=detection_channels_val,
+            detection_p=detection_p_val,
             recording_channel_indices=recording_channel_indices,
+            collisions_prop=collisions_prop,
             template_recording_origin=templates_val_recording_origin,
             original_template_index=original_val_template_index,
             n_oversamples=validation_oversamples,
@@ -207,6 +215,7 @@ def train_decollider(
             data_random_seed=rg,
             noise_max_amplitude=noise_max_amplitude,
             device=device,
+            criterion=criterion,
             summarize=True,
         )
         val_record["epoch"] = epoch
@@ -224,14 +233,22 @@ def train_decollider(
             tqdm.write(summary)
 
         # stop early
-        if not early_stop_decrease_epochs or epoch < early_stop_decrease_epochs:
+        if epoch > max_n_epochs:
+            break
+        if not early_stop_cur_epochs:
+            continue
+        if len(val_losses) < 2 * early_stop_cur_epochs + early_stop_prev_epochs:
             continue
 
-        # See: Early Stopping -- But When?
-        best_epoch = np.argmin(val_losses)
-        if epoch - best_epoch > early_stop_decrease_epochs:
+        prev_losses = val_losses[-early_stop_prev_epochs:-early_stop_cur_epochs]
+        cur_losses = val_losses[-early_stop_cur_epochs:]
+        mean_cur_loss = np.mean(cur_losses)
+        mean_prev_loss = np.mean(prev_losses)
+        std_prev_loss = np.std(prev_losses)
+
+        if mean_cur_loss > mean_prev_loss + std_prev_loss / len(cur_losses):
             if show_progress:
-                tqdm.write(f"Early stopping at {epoch=}, since {best_epoch=}.")
+                tqdm.write(f"Early stopping at {epoch=}, since {mean_cur_loss=}, {mean_prev_loss=}, {std_prev_loss=}.")
             break
 
     validation_dataframe = pd.DataFrame.from_records(val_records)
@@ -259,6 +276,8 @@ def load_epoch(
     templates=None,
     detection_times=None,
     detection_channels=None,
+    detection_p=None,
+    collisions_prop=0.5,
     template_recording_origin=None,
     channel_index=None,
     recording_channel_indices=None,
@@ -306,6 +325,7 @@ def load_epoch(
             recordings,
             times=detection_times,
             channels=detection_channels,
+            p=detection_p,
             recording_channel_indices=recording_channel_indices,
             trough_offset_samples=trough_offset_samples,
             spike_length_samples=spike_length_samples,
@@ -322,6 +342,9 @@ def load_epoch(
         recording_channel_indices=recording_channel_indices,
         trough_offset_samples=trough_offset_samples,
         spike_length_samples=spike_length_samples,
+        collisions_prop=collisions_prop,
+        collisions_times=detection_times,
+        collisions_channels=detection_channels,
         n=noisy_waveforms.shape[0],
         max_abs_amp=noise_max_amplitude,
         dtype=recordings[0].dtype,
@@ -352,9 +375,12 @@ def load_epoch(
 def evaluate_decollider(
     net,
     recordings,
+    criterion,
     templates=None,
     detection_times=None,
     detection_channels=None,
+    detection_p=None,
+    collisions_prop=0.5,
     recording_channel_indices=None,
     template_recording_origin=None,
     original_template_index=None,
@@ -378,6 +404,8 @@ def evaluate_decollider(
         templates=templates,
         detection_times=detection_times,
         detection_channels=detection_channels,
+        detection_p=detection_p,
+        collisions_prop=collisions_prop,
         template_recording_origin=template_recording_origin,
         channel_index=channel_index,
         recording_channel_indices=recording_channel_indices,
@@ -400,8 +428,16 @@ def evaluate_decollider(
     # metrics timer
     # unsupervised task for learning: predict wf from noised_wf
     # preds_noised = net(val_data.noisier_waveforms)
-    preds_noisy = batched_infer(
+    # if summarize:
+    #     loss = net.loss(
+    #         criterion,
+    #         target_batch,
+    #         noisier_waveforms=noised_batch,
+    #         channel_masks=masks,
+    #     )
+    preds_noisy = batched_model_predict(
         net,
+        val_data.noisy_waveforms,
         val_data.noisier_waveforms,
         channel_masks=val_data.channel_masks,
         device=device,
@@ -420,11 +456,15 @@ def evaluate_decollider(
     # below here, summarize is True, and we are working with templates
     # so that gt_waveforms exists
 
+    # uhh
+    # fix below
+
     # supervised task: predict gt_wf (template) from wf (template + noise)
     # template_preds_naive = net(val_data.noisy_waveforms)
-    template_preds_naive = batched_infer(
+    template_preds_naive = batched_model_predict(
         net,
         val_data.noisy_waveforms,
+        val_data.noisier_waveforms,
         channel_masks=val_data.channel_masks,
         device=device,
     )
@@ -606,6 +646,9 @@ def load_noise(
     recordings,
     channels=None,
     which_rec=None,
+    collisions_prop=None,
+    collisions_times=None,
+    collisions_channels=None,
     recording_channel_indices=None,
     trough_offset_samples=42,
     spike_length_samples=121,
@@ -723,6 +766,7 @@ def load_spikes(
     recordings,
     times,
     channels,
+    p=None,
     which_rec=None,
     recording_channel_indices=None,
     trough_offset_samples=42,
@@ -760,6 +804,7 @@ def load_spikes(
             rec,
             times=times[i],
             channels=channels[i],
+            p=p[i] if p is not None else None,
             channel_index=rec_ci,
             trough_offset_samples=trough_offset_samples,
             spike_length_samples=spike_length_samples,
@@ -779,6 +824,7 @@ def load_spikes_singlerec(
     recording,
     times,
     channels,
+    p=None,
     trough_offset_samples=42,
     spike_length_samples=121,
     channel_index=None,
@@ -792,7 +838,7 @@ def load_spikes_singlerec(
     if dtype is None:
         dtype = recording.dtype
 
-    which = rg.choice(times.size, size=n, replace=False)
+    which = rg.choice(times.size, size=n, replace=False, p=p / p.sum())
     times = times[which]
     channels = channels[which]
     order = np.argsort(times)
@@ -883,9 +929,10 @@ def combine_templates(templates, channel_subsets):
 # -- inference utils
 
 
-def batched_infer(
+def batched_model_predict(
     net,
     noisy_waveforms,
+    noisier_waveforms,
     channel_masks=None,
     batch_size=16,
     device=None,
@@ -900,10 +947,13 @@ def batched_infer(
 
     xrange = trange if show_progress else range
     for batch_start in xrange(len(noisy_waveforms)):
-        wfs = noisy_waveforms[batch_start : batch_start + batch_size]
+        nwfs = noisy_waveforms[batch_start : batch_start + batch_size]
+        n2wfs = noisier_waveforms[batch_start : batch_start + batch_size]
         if not is_tensor:
-            wfs = torch.from_numpy(wfs)
-        wfs = wfs.to(device)
+            nwfs = torch.from_numpy(nwfs)
+            n2wfs = torch.from_numpy(n2wfs)
+        nwfs = nwfs.to(device)
+        n2wfs = n2wfs.to(device)
 
         cms = None
         if channel_masks is not None:
@@ -914,10 +964,10 @@ def batched_infer(
         if cms is None and wfs.shape[1] > 1 and torch.isnan(wfs).any():
             cms = torch.isfinite(wfs[:, :, 0])
 
-        wfs = net.predict(wfs, channel_masks=cms)
+        preds = net.model_predict(nwfs, n2wfs, channel_masks=cms)
 
         if is_tensor:
-            out[batch_start : batch_start + batch_size].copy_(wfs, non_blocking=True)
+            out[batch_start : batch_start + batch_size].copy_(preds, non_blocking=True)
         else:
             out[batch_start : batch_start + batch_size] = wfs.numpy(force=True)
 
