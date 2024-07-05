@@ -441,8 +441,10 @@ class InterpUnit(torch.nn.Module):
         overlaps=None,
         rel_ix=None,
     ):
-        self._needs_to_be_fitted()
+        """Badnesses
 
+        How bad is this unit at explaining waveforms on their channels?
+        """
         # a client may already know exactly which spikes they want to compare
         spike_ix = slice(None)
         if rel_ix is None:
@@ -543,7 +545,6 @@ class InterpUnit(torch.nn.Module):
             rel_ix=rel_ix,
         )
         div = badnesses[kind].squeeze()
-        print(f"{len(div)=} {div.min()=} {div.max()=}")
 
         # aggregate over time
         div = aggregate(div)
@@ -579,20 +580,12 @@ class InterpUnit(torch.nn.Module):
         )
 
         # fit/transform with the interpolator
-        residuals = waveforms_rel
         if self.do_interp:
             self.interp.fit(
                 times,
                 waveforms_rel.reshape(n, -1),
                 show_progress=show_progress,
                 **self.fa_fit_kwargs,
-            )
-            residuals = self.residuals_rel(
-                times,
-                waveforms,
-                waveform_channels,
-                rel_ix=rel_ix,
-                padded=False,
             )
         else:
             self.register_buffer(
@@ -914,7 +907,7 @@ class InterpClusterer(torch.nn.Module):
             np.flatnonzero(labels_to_cluster == -1),
         ).all()
         new_clusters, new_counts = np.unique(reclustered.labels, return_counts=True)
-        valid = np.logical_and(new_clusters >= 0, new_counts >= self.min_cluster_size)
+        valid = new_clusters >= 0
         new_counts = new_counts[valid]
         new_clusters = new_clusters[valid]
         orig_outlier_count = (self.labels < 0).sum()
@@ -1123,6 +1116,53 @@ class InterpClusterer(torch.nn.Module):
             return_extra=False,
         )
 
+        # prevent super oversplitting by checking centroid distances
+        ids = np.unique(split_labels)
+        ids = ids[ids >= 0]
+        if ids.size <= 1:
+            return 0
+
+        new_units = []
+        for label in ids:
+            u = InterpUnit(do_interp=False, **self.unit_kw)
+            inu = torch.tensor(in_unit[np.flatnonzero(split_labels == label)])
+            inu, train_data = self.get_training_data(
+                unit_id,
+                in_unit=inu,
+                sampling_method=self.sampling_method,
+            )
+            u.fit_center(**train_data, show_progress=False)
+            new_units.append(u)
+        kind = self.merge_metric
+        min_overlap = self.min_overlap
+        subset_channel_index = None
+        if self.merge_on_waveform_radius:
+            subset_channel_index = self.data.registered_reassign_channel_index
+        nu = len(new_units)
+        divergences = torch.full((nu, nu), torch.nan)
+        for i, ua in enumerate(range(nu)):
+            for j, ub in enumerate(range(nu)):
+                if ua == ub:
+                    divergences[i, j] = 0
+                    continue
+                divergences[i, j] = new_units[ua].divergence(
+                    new_units[ub],
+                    kind=kind,
+                    min_overlap=min_overlap,
+                    subset_channel_index=subset_channel_index,
+                )
+        dists = divergences.numpy(force=True)
+        dists = np.maximum(dists, dists.T)
+
+        dists[np.isinf(dists)] = dists[np.isfinite(dists)].max() + 10
+        assert np.isfinite(dists).all(), f"{dists=}"
+        d = dists[np.triu_indices(dists.shape[0], k=1)]
+        Z = linkage(d, method=self.merge_linkage)
+        new_labels = fcluster(Z, self.merge_threshold, criterion="distance")
+        new_labels -= 1  # why do they do this...
+        kept = split_labels >= 0
+        split_labels[kept] = new_labels[split_labels[kept]]
+
         # -- deal with relabeling
         split_units, counts = np.unique(split_labels, return_counts=True)
         n_split_full = split_units.size
@@ -1250,7 +1290,7 @@ class InterpClusterer(torch.nn.Module):
         )
         merge_dists = self.merge_sym_function(merge_dists, merge_dists.T)
         merge_dists = merge_dists.numpy(force=True)
-        merge_dists[np.isinf(merge_dists)] = merge_dists.max() + 10
+        merge_dists[np.isinf(merge_dists)] = merge_dists[np.isfinite(merge_dists)].max() + 10
         d = merge_dists[np.triu_indices(merge_dists.shape[0], k=1)]
         Z = linkage(d, method=self.merge_linkage)
         new_labels = fcluster(Z, self.merge_threshold, criterion="distance")
