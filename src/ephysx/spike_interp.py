@@ -111,7 +111,7 @@ class SpikeData(torch.nn.Module):
             indices = self.keepers[index]
             mask = np.zeros(self.original_tpca_embeds.shape[0], dtype=bool)
             mask[indices] = 1
-            
+
             waveforms = _channel_subset_by_chunk(
                 mask,
                 self.original_tpca_embeds,
@@ -128,7 +128,7 @@ class SpikeData(torch.nn.Module):
             indices = self.keepers[index]
             mask = np.zeros(self.original_tpca_embeds.shape[0], dtype=bool)
             mask[indices] = 1
-            
+
             waveforms = _read_by_chunk(
                 mask,
                 self.original_tpca_embeds,
@@ -159,6 +159,8 @@ default_residual_pca_kwargs = dict(
     atol=0.1,
     max_iter=25,
     pca_on_waveform_channels=True,
+    impute_zeros=False,
+    pca_noise_scale=0.0,
 )
 
 
@@ -185,6 +187,8 @@ class InterpUnit(torch.nn.Module):
         fa_kwargs=default_fa_kwargs,
         residual_pca_kwargs=default_residual_pca_kwargs,
         fa_fit_kwargs=default_fa_fit_kwargs,
+        channel_strategy="snr",
+        channel_strategy_snr_min=25.0,
         pca_on_waveform_channels=True,
         scale_residual_embed=False,
     ):
@@ -194,29 +198,24 @@ class InterpUnit(torch.nn.Module):
         self.min_overlap = min_overlap
         self.n_chans_full = n_chans_full
         self.n_chans_unit = n_chans_unit
+        self.n_chans_waveform = n_chans_waveform
         self.waveform_rank = waveform_rank
-        self.input_dim = waveform_rank * self.n_chans_unit
         self.scale_residual_embed = scale_residual_embed
+        self.channel_strategy = channel_strategy
+        self.channel_strategy_snr_min = channel_strategy_snr_min
+        self.t_bounds = t_bounds
 
         pca_centered = True
-        if do_interp:
-            self.interp = InterpFactorAnalysis(
-                t_bounds, output_dim=self.input_dim, **fa_kwargs
-            )
+        if self.do_interp:
             self.fa_fit_kwargs = fa_fit_kwargs
             pca_centered = False
-        pca_kwargs = residual_pca_kwargs | dict(centered=pca_centered)
-        self.pca_on_waveform_channels = pca_kwargs.pop("pca_on_waveform_channels", True)
-        pca_input_dim = self.input_dim
-        if self.pca_on_waveform_channels:
-            pca_input_dim = self.waveform_rank * n_chans_waveform
-        self.pca = MaskedPCA(
-            input_dim=pca_input_dim, rank=residual_pca_rank, **pca_kwargs
-        )
+        self.pca_kwargs = residual_pca_kwargs | dict(centered=pca_centered, rank=residual_pca_rank)
+        self.pca_on_waveform_channels = self.pca_kwargs.pop("pca_on_waveform_channels", True)
+        self.pca_impute_zeros = self.pca_kwargs.pop("pca_impute_zeros", False)
+        self.pca_noise_scale = self.pca_kwargs.pop("pca_noise_scale", 0.0)
 
         # unit channels logic
         self.needs_fit = True
-
         self.register_buffer(
             "inv_lambda", torch.tensor(1.0 / (amplitude_scaling_std**2))
         )
@@ -224,23 +223,52 @@ class InterpUnit(torch.nn.Module):
             "scale_clip_low", torch.tensor(1.0 / amplitude_scaling_limit)
         )
         self.register_buffer("scale_clip_high", torch.tensor(amplitude_scaling_limit))
+    
+    def _init_models(self):
+        self.input_dim = self.waveform_rank * self.n_chans_unit
+        if self.do_interp:
+            self.interp = InterpFactorAnalysis(
+                self.t_bounds, output_dim=self.input_dim, **fa_kwargs
+            )
+
+        pca_input_dim = self.input_dim
+        if self.pca_on_waveform_channels:
+            pca_input_dim = self.waveform_rank * n_chans_waveform
+
+        self.pca = MaskedPCA(
+            input_dim=pca_input_dim, **self.pca_kwargs
+        )
 
     def _needs_to_be_fitted(self):
         assert not self.needs_fit
 
     def determine_position_(self, static_amp_vecs, geom, cluster_channel_index):
-        assert cluster_channel_index.shape == (self.n_chans_full, self.n_chans_unit)
+        if cluster_channel_index is not None:
+            assert cluster_channel_index.shape == (self.n_chans_full, self.n_chans_unit)
         device = static_amp_vecs.device
 
-        count = torch.sqrt(torch.isfinite(static_amp_vecs).sum(0))
-        snr = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0)) * count
+        count = torch.isfinite(static_amp_vecs).sum(0)
+        snr = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0)) * torch.sqrt(count)
+        self.snr = snr
+        self.count = count
         self.com = (snr * geom[:, 1]).sum() / snr.sum()
-        self.max_channel = snr.argmax()
+        if self.channel_strategy in ("snr", "peak"):
+            self.max_channel = snr.argmax()
+        elif self.channel_strategy in ("com",):
+            fullcom = (snr[:, None] * geom).sum() / snr.sum()
+            self.max_channel = (geom - fullcom).square().sum(1).argmin()
+        else:
+            assert False
+
+        if self.channel_strategy in ("peak", "com"):
+            my_chans = cluster_channel_index[self.max_channel]
+        else:
+            (my_chans,) = torch.nonzero(snr > self.channel_strategy_snr_min, as_tuple=True)
+            self.n_chans_unit = my_chans.numel()
 
         channel_reindexer = torch.full(
             (self.n_chans_full + 1,), self.n_chans_unit, device=device
         )
-        my_chans = cluster_channel_index[self.max_channel]
         self.channels = my_chans.clone()
         my_valid = my_chans < self.n_chans_full
         my_ixs = torch.arange(self.n_chans_unit, device=device)[my_valid]
@@ -506,7 +534,6 @@ class InterpUnit(torch.nn.Module):
                 other_waveform = other.to_waveform_channels(
                     other_waveform,
                     waveform_channels=other_channels[None],
-                    rel_ix=rel_ix,
                 )
             _, _, badnesses = self.spike_badnesses(
                 times=None,
@@ -562,13 +589,15 @@ class InterpUnit(torch.nn.Module):
         waveform_channels,
         static_amp_vecs,
         geom,
-        cluster_channel_index,
-        waveform_channel_index,
+        cluster_channel_index=None,
+        waveform_channel_index=None,
         show_progress=False,
     ):
         # transfer waveform -> unit channels, filling with nans
         self.train()
         self.determine_position_(static_amp_vecs, geom, cluster_channel_index)
+        self._init_models()
+        self.to(waveforms.device)
         n = len(times)
         rel_ix = self.rel_ix(waveform_channels)
         waveforms_rel = self.to_unit_channels(
@@ -600,13 +629,13 @@ class InterpUnit(torch.nn.Module):
         waveform_channels,
         static_amp_vecs,
         geom,
-        cluster_channel_index,
         waveform_channel_index,
         show_progress=False,
     ):
         rel_ix = self.rel_ix(waveform_channels)
         n = len(times)
         if self.do_interp:
+            assert not self.pca_impute_zeros, "not implemented"
             residuals = self.residuals_rel(
                 times,
                 waveforms,
@@ -620,7 +649,7 @@ class InterpUnit(torch.nn.Module):
                 times,
                 rel_ix=rel_ix,
                 fill_mode="constant",
-                constant_value=torch.nan,
+                constant_value=0.0 if self.pca_impute_zeros else torch.nan,
             )
             residuals = waveforms_rel.reshape(n, -1) - self.mean
         if self.pca_on_waveform_channels:
@@ -629,6 +658,10 @@ class InterpUnit(torch.nn.Module):
             residuals = self.to_waveform_channels(
                 residuals, wfcs
             )
+        # if self.pca_impute_zeros:
+        #     torch.nan_to_num(residuals, out=residuals)
+        if self.pca_noise_scale:
+            residuals = torch.normal(residuals, std=self.pca_noise_scale)
         residuals = residuals.reshape(len(residuals), -1)
         self.pca.fit(residuals)
         self.needs_fit = False
@@ -640,7 +673,7 @@ class DPCSplitKwargs:
     rank: int = 2
     sigma_local: Union[str, float] = "rule_of_thumb"
     sigma_regional: Optional[float] = None
-    n_neighbors_search: int = 500
+    n_neighbors_search: int = 250
     allow_single_cluster_outlier_removal: bool = True
     recursive: bool = True
     split_on_train: bool = False
@@ -682,8 +715,11 @@ class InterpClusterer(torch.nn.Module):
         reassign_metric="1-scaledr^2",
         merge_metric="1-scaledr^2",
         merge_threshold=0.25,
+        zip_threshold=0.1,
         merge_sym_function=torch.maximum,
         merge_linkage="complete",
+        channel_strategy="snr",
+        channel_strategy_snr_min=25.0,
         merge_on_waveform_radius=True,
         outlier_explained_var=0.0,
         sampling_sigma=0.5,
@@ -703,6 +739,8 @@ class InterpClusterer(torch.nn.Module):
         self.split_sampling_method = split_sampling_method
         self.split_waveform_kind = split_waveform_kind
         self.sampling_sigma = sampling_sigma
+        self.zip_threshold = zip_threshold
+        self.channel_strategy = channel_strategy
 
         self.data = _load_data(
             sorting,
@@ -718,7 +756,7 @@ class InterpClusterer(torch.nn.Module):
         self.residual_pca_rank = residual_pca_rank
         self.unit_kw = dict(
             t_bounds=t_bounds,
-            n_chans_unit=self.data.n_chans_unit,
+            n_chans_unit=self.data.n_chans_unit if channel_strategy != "snr" else None,
             n_chans_waveform=self.data.n_chans_waveform,
             waveform_rank=self.data.waveform_rank,
             min_overlap=min_overlap,
@@ -727,9 +765,11 @@ class InterpClusterer(torch.nn.Module):
             residual_pca_kwargs=residual_pca_kwargs,
             n_chans_full=self.data.n_chans_full,
             scale_residual_embed=scale_residual_embed,
+            channel_strategy=channel_strategy,
+            channel_strategy_snr_min=channel_strategy_snr_min,
         )
 
-        # torch.manual_seed(self.rg.bit_generator.random_raw())
+        torch.manual_seed(self.rg.bit_generator.random_raw())
         self.labels = torch.tensor(self.data.spike_train.labels[self.data.keepers], dtype=label_dtype)
         self.models = torch.nn.ModuleDict()
         self.register_buffer("_device", torch.tensor(0))
@@ -933,8 +973,9 @@ class InterpClusterer(torch.nn.Module):
         self.labels[ixs_to_replace] = replacers
         # self.cleanup()
 
-    def residual_dpc_split(self):
-        unit_ids_to_split = list(self.unit_ids())
+    def residual_dpc_split(self, unit_ids_to_split=None):
+        if unit_ids_to_split is None:
+            unit_ids_to_split = list(self.unit_ids())
         n_orig = len(unit_ids_to_split)
         n_splits = []
 
@@ -1093,6 +1134,7 @@ class InterpClusterer(torch.nn.Module):
 
     def zipper_split(self):
         n_new = 0
+        self._zipper_parents = {}
         for unit_id in tqdm(self.unit_ids(), desc="Zipper split"):
             n_new += self.zipper_split_unit(unit_id)
         print(f"Zipper split broke off {n_new} new units.")
@@ -1158,7 +1200,7 @@ class InterpClusterer(torch.nn.Module):
         assert np.isfinite(dists).all(), f"{dists=}"
         d = dists[np.triu_indices(dists.shape[0], k=1)]
         Z = linkage(d, method=self.merge_linkage)
-        new_labels = fcluster(Z, self.merge_threshold, criterion="distance")
+        new_labels = fcluster(Z, self.zip_threshold, criterion="distance")
         new_labels -= 1  # why do they do this...
         kept = split_labels >= 0
         split_labels[kept] = new_labels[split_labels[kept]]
@@ -1185,6 +1227,7 @@ class InterpClusterer(torch.nn.Module):
         self.labels[in_unit_full] = -1
         new_unit_ids = (unit_id, *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)))
         for split_label, new_label in zip(split_units, new_unit_ids):
+            self._zipper_parents[self.normalize_key(new_label)] = self.normalize_key(unit_id)
             in_split = in_unit[split_labels == split_label]
             self.labels[in_split] = new_label
         return len(new_unit_ids) - 1 #, new_unit_ids
@@ -1390,7 +1433,8 @@ class InterpClusterer(torch.nn.Module):
         train_data = self.spike_data(in_unit, waveform_kind=waveform_kind)
         train_data["static_amp_vecs"] = self.data.static_amp_vecs[in_unit].to(self.device)
         train_data["geom"] = self.data.registered_geom
-        train_data["cluster_channel_index"] = self.data.cluster_channel_index
+        if self.channel_strategy != "snr":
+            train_data["cluster_channel_index"] = self.data.cluster_channel_index
         if waveform_kind == "original":
             train_data["waveform_channel_index"] = self.data.registered_original_channel_index
         elif waveform_kind == "reassign":
@@ -1425,7 +1469,7 @@ class MaskedPCA(torch.nn.Module):
     def __init__(
         self,
         input_dim,
-        rank,
+        rank=2,
         max_iter=100,
         check_every=5,
         n_oversamples=10,
