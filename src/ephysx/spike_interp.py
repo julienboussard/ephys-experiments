@@ -152,7 +152,7 @@ class SpikeData(torch.nn.Module):
             waveforms = torch.from_numpy(waveforms)
 
         if device is not None:
-            waveforms = waveforms.to(device, non_blocking=self.pin)
+            waveforms = waveforms.to(device)#, non_blocking=self.pin)
         return waveforms
 
 
@@ -203,6 +203,8 @@ class InterpUnit(torch.nn.Module):
         fa_fit_kwargs=default_fa_fit_kwargs,
         channel_strategy="snr",
         channel_strategy_snr_min=25.0,
+        channel_strategy_snr_minamp=3.0,
+        batch_size=16384,
         pca_on_waveform_channels=True,
         scale_residual_embed=False,
     ):
@@ -217,7 +219,9 @@ class InterpUnit(torch.nn.Module):
         self.scale_residual_embed = scale_residual_embed
         self.channel_strategy = channel_strategy
         self.channel_strategy_snr_min = channel_strategy_snr_min
+        self.channel_strategy_snr_minamp = channel_strategy_snr_minamp
         self.t_bounds = t_bounds
+        self.batch_size = batch_size
 
         pca_centered = True
         if self.do_interp:
@@ -237,7 +241,7 @@ class InterpUnit(torch.nn.Module):
             "scale_clip_low", torch.tensor(1.0 / amplitude_scaling_limit)
         )
         self.register_buffer("scale_clip_high", torch.tensor(amplitude_scaling_limit))
-    
+
     def _init_models(self):
         self.input_dim = self.waveform_rank * self.n_chans_unit
         if self.do_interp:
@@ -262,7 +266,8 @@ class InterpUnit(torch.nn.Module):
         device = static_amp_vecs.device
 
         count = torch.isfinite(static_amp_vecs).sum(0)
-        snr = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0)) * torch.sqrt(count)
+        ampmean = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0))
+        snr = ampmean * torch.sqrt(count)
         self.snr = snr
         self.count = count
         self.com = (snr * geom[:, 1]).sum() / snr.sum()
@@ -277,7 +282,11 @@ class InterpUnit(torch.nn.Module):
         if self.channel_strategy in ("peak", "com"):
             my_chans = cluster_channel_index[self.max_channel]
         else:
-            (my_chans,) = torch.nonzero(snr > self.channel_strategy_snr_min, as_tuple=True)
+            mask = torch.logical_and(
+                snr > self.channel_strategy_snr_min,
+                ampmean > self.channel_strategy_snr_minamp,
+            )
+            (my_chans,) = torch.nonzero(mask, as_tuple=True)
             self.n_chans_unit = my_chans.numel()
 
         channel_reindexer = torch.full(
@@ -638,6 +647,38 @@ class InterpUnit(torch.nn.Module):
                 torch.nan_to_num(torch.nanmean(waveforms_rel.reshape(n, -1), dim=0)),
             )
 
+    def impute(
+        self,
+        times,
+        waveforms,
+        waveform_channels,
+        waveform_channel_index=None,
+    ):
+        rel_ix = self.rel_ix(waveform_channels)
+        n = len(times)
+        residuals = self.residuals_rel(
+            times,
+            waveforms,
+            waveform_channels,
+            padded=False,
+        )
+        residuals = residuals.reshape(n, -1)
+        if self.pca_on_waveform_channels:
+            wfcs = waveform_channel_index[self.max_channel]
+            wfcs = wfcs[None].broadcast_to((len(residuals), *wfcs.shape))
+            residuals = self.to_waveform_channels(
+                residuals, wfcs
+            )
+        embeds = self.pca.transform_precentered(residuals)
+        recons = self.pca.backward_precentered(embeds)
+        imputed = torch.where(
+            torch.isfinite(residuals),
+            residuals,
+            recons,
+        )
+        return imputed
+        
+
     def fit_residual(
         self,
         times,
@@ -958,7 +999,8 @@ class InterpClusterer(torch.nn.Module):
                         waveform_kind=self.split_waveform_kind,
                         sampling_method=self.split_sampling_method,
                     )
-                    del train_data['cluster_channel_index']
+                    if self.channel_strategy != "snr":
+                        del train_data['cluster_channel_index']
                     model.fit_residual(**train_data, show_progress=False)
                     model.fit_indices = in_unit
         else:
@@ -983,7 +1025,8 @@ class InterpClusterer(torch.nn.Module):
                         waveform_kind=self.split_waveform_kind,
                         sampling_method=self.split_sampling_method,
                     )
-                    del train_data['cluster_channel_index']
+                    if self.channel_strategy != "snr":
+                        del train_data['cluster_channel_index']
                     model.fit_residual(**train_data, show_progress=False)
                     model.fit_indices = in_unit
                 return model
@@ -1177,6 +1220,50 @@ class InterpClusterer(torch.nn.Module):
             in_split = in_unit_full[split_labels == split_label]
             self.labels[in_split] = new_label
         return len(new_unit_ids) - 1, new_unit_ids
+
+    def kmeanspp(self, unit_id, sampling_method="time_amp_reweighted", n_clust=5, n_iter=0):
+        in_unit, data = self.get_training_data(
+            unit_id,
+            n=None,
+            in_unit=None,
+            waveform_kind=self.split_waveform_kind,
+            sampling_method=None,
+        )
+        waveforms = self[unit_id].impute(
+            data['times'],
+            data['waveforms'],
+            data['waveform_channels'],
+            data['waveform_channel_index'],
+        )
+
+        # pick centroids and reassign imputed wfs
+        n = len(waveforms)
+        centroid_ixs = []
+        dists = torch.full((n,), torch.inf, dtype=waveforms.dtype, device=waveforms.device)
+        assignments = torch.zeros((n,), dtype=torch.long, device=self.labels.device)
+        for j in range(n_clust):
+            if j == 0:
+                newix = self.rg.integers(n)
+            else:
+                newix = self.rg.choice(n, p=(dists / dists.sum()).numpy(force=True))
+            centroid_ixs.append(newix)
+            curcent = waveforms[newix][None]
+            newdists = (waveforms - curcent).square().sum(1)
+            closer = newdists < dists
+            assignments[closer] = j
+            dists[closer] = newdists[closer]
+
+        # replace e with a buffer that is scattered into
+        for i in range(n_iter):
+            # update centroids
+            e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
+            centroids = (e / e.sum(0)).T @ waveforms
+            dists = waveforms[:, None, :] - centroids[None, :, :]
+            dists = dists.square_().sum(2)
+            assignments = torch.argmin(dists, 1)
+
+        return in_unit, assignments
+            
 
     def parcellate(self):
         unit_ids_to_split = list(self.unit_ids())
@@ -1493,10 +1580,8 @@ class InterpClusterer(torch.nn.Module):
                     keep = np.flatnonzero(results <= exclude_above)
                     if not keep.size:
                         continue
-                    which = which[keep]
-                    results = results[keep]
-                ii.append(np.broadcast_to(np.array([j]), which.shape))
                 jj.append(which[keep])
+                ii.append(np.broadcast_to(np.array([j]), jj[-1].shape))
                 values.append(results[keep])
         else:
             import joblib
@@ -1550,7 +1635,6 @@ class InterpClusterer(torch.nn.Module):
                 need_alloc = True
                 del self._reas_bufs
         if need_alloc:
-            print('realloc')
             nalloc = int(np.ceil(nout * 1.25))
             vout = np.empty(nalloc, dtype=dtype)
             iiout = np.empty(nalloc, dtype=np.int32)
