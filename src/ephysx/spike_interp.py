@@ -272,15 +272,15 @@ class InterpUnit(torch.nn.Module):
         self.count = count
         self.com = (snr * geom[:, 1]).sum() / snr.sum()
         if self.channel_strategy in ("snr", "peak"):
-            self.max_channel = snr.argmax()
+            max_channel = snr.argmax()
         elif self.channel_strategy in ("com",):
             fullcom = (snr[:, None] * geom).sum() / snr.sum()
-            self.max_channel = (geom - fullcom).square().sum(1).argmin()
+            max_channel = (geom - fullcom).square().sum(1).argmin()
         else:
             assert False
 
         if self.channel_strategy in ("peak", "com"):
-            my_chans = cluster_channel_index[self.max_channel]
+            my_chans = cluster_channel_index[max_channel]
         else:
             mask = torch.logical_and(
                 snr > self.channel_strategy_snr_min,
@@ -292,14 +292,16 @@ class InterpUnit(torch.nn.Module):
         channel_reindexer = torch.full(
             (self.n_chans_full + 1,), self.n_chans_unit, device=device
         )
-        self.channels = my_chans.clone()
         my_valid = my_chans < self.n_chans_full
         my_ixs = torch.arange(self.n_chans_unit, device=device)[my_valid]
         channel_reindexer[my_chans[my_valid]] = my_ixs
         if hasattr(self, "channel_reindexer"):
             self.channel_reindexer.copy_(channel_reindexer)
+            self.max_channel.copy_(max_channel)
         else:
             self.register_buffer("channel_reindexer", channel_reindexer)
+            self.register_buffer("max_channel", max_channel)
+        self.register_buffer("channels", my_chans)
 
     def overlaps(self, static_channels):
         """
@@ -773,7 +775,7 @@ class InterpClusterer(torch.nn.Module):
         reassign_metric="1-scaledr^2",
         merge_metric="1-scaledr^2",
         merge_threshold=0.25,
-        zip_threshold=0.1,
+        zip_threshold=0.15,
         merge_sym_function=torch.maximum,
         merge_linkage="complete",
         channel_strategy="snr",
@@ -1169,8 +1171,9 @@ class InterpClusterer(torch.nn.Module):
         if n_split_full - 1 == n_split == 1:
             if self.dpc_split_kw.allow_single_cluster_outlier_removal:
                 unit.needs_fit = True
-                self.labels[in_unit[split_labels < 0]] = -1
-                return 0, [] 
+                self.labels[in_unit_full] = -1
+                self.labels[in_unit[split_labels >= 0]] = uid
+                return 0, []
 
         # case 0: nothing happened.
         if n_split <= n_split_full <= 1:
@@ -1229,6 +1232,7 @@ class InterpClusterer(torch.nn.Module):
             waveform_kind=self.split_waveform_kind,
             sampling_method=None,
         )
+        n_clust = min(n_clust, in_unit.numel() // self.min_cluster_size)
         waveforms = self[unit_id].impute(
             data['times'],
             data['waveforms'],
@@ -1262,8 +1266,151 @@ class InterpClusterer(torch.nn.Module):
             dists = dists.square_().sum(2)
             assignments = torch.argmin(dists, 1)
 
-        return in_unit, assignments
+        return in_unit, assignments.to(in_unit)
+
+    def constrain_split_centroids(self, in_unit, sub_labels):
+        ids = torch.unique(sub_labels)
+        ids = ids[ids >= 0]
+        new_units = []
+
+        # fit sub-units
+        for label in ids:
+            u = InterpUnit(
+                do_interp=False,
+                **self.unit_kw,
+            )
+            inu = in_unit[sub_labels == label]
+            inu, train_data = self.get_training_data(
+                unit_id=None,
+                waveform_kind="original",
+                in_unit=inu,
+                sampling_method=self.sampling_method,
+            )
+            u.fit_center(**train_data, show_progress=False)
+            new_units.append(u)
+
+        # remove dead units
+        is_alive = np.array([bool(u.n_chans_unit) for u in new_units])
+        is_alive = is_alive[sub_labels]
+        ju = [(j, u) for j, u in enumerate(new_units) if u.n_chans_unit]
+        
+        # sub-merge
+        kind = self.merge_metric
+        min_overlap = self.min_overlap
+        subset_channel_index = None
+        if self.merge_on_waveform_radius:
+            subset_channel_index = self.data.registered_reassign_channel_index
+        nu = len(new_units)
+        divergences = torch.full((nu, nu), torch.nan)
+        for i, ua in ju:
+            for j, ub in ju:
+                if i == j:
+                    divergences[i, j] = 0
+                    continue
+                divergences[i, j] = ua.divergence(
+                    ub,
+                    kind=kind,
+                    min_overlap=min_overlap,
+                    subset_channel_index=subset_channel_index,
+                )
+        
+        dists = self.merge_sym_function(divergences, divergences.T)
+        dists = dists.numpy(force=True)
+        valid = np.isfinite(dists)
+        if not valid.all():
+            dists[np.logical_not(valid)] = dists[valid].max() + 10
+        d = dists[np.triu_indices(dists.shape[0], k=1)]
+        Z = linkage(d, method=self.merge_linkage)
+        new_labels = fcluster(Z, self.zip_threshold, criterion="distance")
+        new_labels -= 1
+
+        _, merge_labels = np.unique(new_labels[sub_labels], return_inverse=True)
+        
+        labels = np.where(
+            is_alive,
+            merge_labels,
+            -1,
+        )
+        return labels
             
+        
+    def kmeans_split(self):
+        n_new = 0
+        for unit_id in tqdm(self.unit_ids(), desc="kmeans split"):
+            n_new_unit, _ = self.kmeans_split_unit(unit_id)
+            n_new += n_new_unit
+        print(f"kmeans split broke off {n_new} new units.")
+    
+    def kmeans_split_unit(self, unit_id):
+        (in_unit_full,) = torch.nonzero(self.labels == unit_id, as_tuple=True)
+        in_unit, split_labels = self.kmeanspp(unit_id, n_clust=5, n_iter=10)
+        if np.unique(split_labels).size <= 1:
+            return 0, []
+        print(f"a {np.unique(split_labels)=}")
+        split_labels = self.constrain_split_centroids(in_unit, split_labels)
+        print(f"b {np.unique(split_labels)=}")
+
+        split_units, counts = np.unique(split_labels, return_counts=True)
+        n_split_full = split_units.size
+        valid = np.logical_and(split_units >= 0, counts >= self.min_cluster_size)
+        counts = counts[valid]
+        split_units = split_units[valid]
+        n_split = split_units.size
+        print(f"{n_split=}")
+
+        # case 1: single-unit outlier removal. re-fit but don't re-split.
+        if n_split_full - 1 == n_split == 1:
+            if self.dpc_split_kw.allow_single_cluster_outlier_removal:
+                self[unit_id].needs_fit = True
+                self.labels[in_unit_full] = -1
+                self.labels[in_unit[split_labels >= 0]] = unit_id
+                return 0, [] 
+
+        # case 0: nothing happened.
+        if n_split <= n_split_full <= 1:
+            return 0, []
+
+        # in all cases below, we want to re-fit this unit
+        self[unit_id].needs_fit = True
+
+        # case 2: something legitimately took place.
+        # here, split_unit 0 retains label uid. split units >=1 get new labels.
+        assert n_split > 1
+        self.labels[in_unit_full] = -1
+        new_unit_ids = (unit_id, *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)))
+        for split_label, new_label in zip(split_units, new_unit_ids):
+            in_split = in_unit[split_labels == split_label]
+            self.labels[in_split] = new_label
+
+        # reassign within unit if necessary
+        if not self.dpc_split_kw.reassign_within_split:
+            return len(new_unit_ids) - 1, new_unit_ids
+
+        new_units = self.m_step(to_fit=new_unit_ids, store=False, show_progress=False)
+        divergences = self.reassignment_divergences(
+            which_spikes=in_unit_full,
+            units=new_units,
+            show_progress=False,
+        )
+        split_labels = sparse_reassign(divergences, 1.0 - self.outlier_explained_var)
+        kept = np.flatnonzero(split_labels >= 0)
+
+        # if reassign kills everything, just keep the state before reassignment
+        if not kept.size:
+            return 0, []
+
+        split_units, counts = np.unique(split_labels[kept], return_counts=True)
+        split_units = split_units[counts >= self.min_cluster_size]
+        n_split = split_units.size
+        if n_split <= 1:
+            return 0, []
+
+        self.labels[in_unit_full] = -1
+        new_unit_ids = (unit_id, *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)))
+        for split_label, new_label in zip(split_units, new_unit_ids):
+            in_split = in_unit_full[split_labels == split_label]
+            self.labels[in_split] = new_label
+        return len(new_unit_ids) - 1, new_unit_ids
 
     def parcellate(self):
         unit_ids_to_split = list(self.unit_ids())
@@ -1353,7 +1500,7 @@ class InterpClusterer(torch.nn.Module):
             u = InterpUnit(do_interp=False, **self.unit_kw)
             inu = torch.tensor(in_unit[np.flatnonzero(split_labels == label)])
             inu, train_data = self.get_training_data(
-                unit_id,
+                unit_id=None,
                 in_unit=inu,
                 sampling_method=self.sampling_method,
             )
@@ -1488,17 +1635,24 @@ class InterpClusterer(torch.nn.Module):
             self.labels[in_split] = new_label
         return n_split - 1
 
-    def central_divergences(self, kind=None, min_overlap=0.5):
+    def central_divergences(self, units_a=None, units_b=None, kind=None, min_overlap=None):
         if kind is None:
             kind = self.merge_metric
         subset_channel_index = None
         if self.merge_on_waveform_radius:
             subset_channel_index = self.data.registered_reassign_channel_index
+        if min_overlap is None:
+            min_overlap = self.min_overlap
         units = self.unit_ids()
-        nu = units.numel()
-        divergences = torch.full((nu, nu), torch.nan)
-        for i, ua in enumerate(units):
-            for j, ub in enumerate(units):
+        if units_a is None:
+            units_a = units
+        if units_b is None:
+            units_b = units
+        nua = len(units_a)
+        nub = len(units_b)
+        divergences = torch.full((nua, nub), torch.nan)
+        for i, ua in enumerate(units_a):
+            for j, ub in enumerate(units_b):
                 if ua == ub:
                     divergences[i, j] = 0
                     continue
@@ -1664,7 +1818,7 @@ class InterpClusterer(torch.nn.Module):
         )
         reas_pct = 100 * (self.labels != new_labels).to(torch.float).mean().numpy(force=True)
         print(f"{reas_pct:.1f}% of spikes reassigned")
-        self.labels = new_labels
+        self.labels.copy_(new_labels)
         self.cleanup()
 
     def get_indices(self, uid, n=None, in_unit=None, sampling_method=None):
@@ -1698,8 +1852,8 @@ class InterpClusterer(torch.nn.Module):
         in_unit = in_unit[torch.from_numpy(which)]
         return in_unit
 
-    def get_training_data(self, uid, n=None, in_unit=None, waveform_kind="original", sampling_method=None):
-        in_unit = self.get_indices(uid, n=n, in_unit=in_unit)
+    def get_training_data(self, unit_id, n=None, in_unit=None, waveform_kind="original", sampling_method=None):
+        in_unit = self.get_indices(unit_id, n=n, in_unit=in_unit)
         train_data = self.spike_data(in_unit, waveform_kind=waveform_kind)
         train_data["static_amp_vecs"] = self.data.static_amp_vecs[in_unit].to(self.device)
         train_data["geom"] = self.data.registered_geom
